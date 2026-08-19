@@ -1,0 +1,92 @@
+# Python
+venv/
+env/
+.venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist-info/
+pip-wheel-metadata/
+
+# Build and release artifacts
+build/
+dist/
+release/
+releases/
+*.app/
+*.dmg
+*.pkg
+*.zip
+*.msi
+*.msix
+*.exe
+*.spec.lock
+
+# Project output files (generated LAZ, DEM, hillshades)
+output/
+
+# Platform binaries and geospatial data are generated locally by the bundling
+# scripts. Keep only .gitkeep placeholders so every OS starts from source.
+bundle_bins/*/*
+!bundle_bins/*/.gitkeep
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+Macintosh HD
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment
+.env
+.env.*
+!.env.example
+.env.local
+
+# User config (stored in ~/Library/Application Support/)
+config.json
+
+# Logs
+*.log
+
+# Temporary and local cache files
+*.tmp
+*.temp
+*.bak
+*.orig
+WESM.csv
+aws_resources.geojson
+
+# Ignore AI folders
+.claude/
