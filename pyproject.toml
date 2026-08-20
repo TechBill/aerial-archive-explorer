@@ -1,6 +1,6 @@
 [project]
 name = "aerial-archive-explorer"
-version = "2.0.1"
+version = "2.0.2"
 description = "Search and download historic USGS aerial photographs by location."
 requires-python = ">=3.11"
 dependencies = [
