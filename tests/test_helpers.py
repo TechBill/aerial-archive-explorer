@@ -6,12 +6,14 @@ import threading
 import pytest
 
 from aerial_archive_explorer import (
+    AerialFrame,
     ApiError,
     DownloadProduct,
     DiagnosticsBuffer,
     CredentialStore,
     SearchQuery,
     best_product,
+    build_metadata_block,
     classify_product,
     coordinate_boxes,
     extract_frame_footprint,
@@ -188,6 +190,39 @@ def test_point_in_footprint_inside_outside_boundary_and_invalid():
 def test_polygon_area_signed():
     footprint = ((-94.0, 38.0), (-92.0, 38.0), (-92.0, 36.0), (-94.0, 36.0))
     assert abs(polygon_area(footprint)) == pytest.approx(4.0)
+
+
+def test_build_metadata_block_includes_identity_and_corners():
+    frame = AerialFrame(
+        entity_id="AR1VXA000010011", display_id="1VXA000010011",
+        acquisition_date=dt.date(1959, 3, 22), agency="1", project="VXA00",
+        roll="000001", frame="11", scale="18000", image_type="24", quality="8",
+        footprint=((-93.302812, 37.233226), (-93.257739, 37.232884),
+                   (-93.258178, 37.196844), (-93.30323, 37.197187)),
+    )
+    block = build_metadata_block(frame)
+    assert "ENTITY_ID: AR1VXA000010011" in block
+    assert "ACQUISITION_DATE: 1959-03-22" in block
+    assert "PROJECT: VXA00" in block
+    assert "ROLL: 000001" in block
+    assert "FRAME: 11" in block
+    assert "SCALE: 18000" in block
+    assert "NW_CORNER: -93.302812, 37.233226" in block
+    assert "NE_CORNER: -93.257739, 37.232884" in block
+    assert "SE_CORNER: -93.258178, 37.196844" in block
+    assert "SW_CORNER: -93.303230, 37.197187" in block
+    assert "CENTER: -93.280490, 37.215035" in block
+    assert "SOURCE_CRS: EPSG:4326" in block
+    assert "CORNER_ORDER: NW, NE, SE, SW" in block
+
+
+def test_build_metadata_block_handles_missing_footprint():
+    frame = AerialFrame(entity_id="E1", display_id="E1")
+    block = build_metadata_block(frame)
+    assert "ENTITY_ID: E1" in block
+    assert "ACQUISITION_DATE: unknown" in block
+    assert "NW_CORNER: unknown" in block
+    assert "CENTER: unknown" in block
 
 
 def product(name, available=True, order=False):

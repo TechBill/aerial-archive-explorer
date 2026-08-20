@@ -970,6 +970,100 @@ def prepare_viewable_image(path: Path, cancel: threading.Event) -> Path:
         ) from exc
 
 
+def build_metadata_block(frame: AerialFrame) -> str:
+    """Render a fixed-format USGS identity/footprint block for embedding in
+    a saved TIFF's ImageDescription tag (270).
+
+    Includes the raw four-corner footprint and center point flat as
+    decimal-degree longitude/latitude pairs -- not just the combined
+    "Coordinates / footprint" summary -- plus the archival identity
+    fields (entity ID, acquisition date, project/roll/frame, scale) a
+    researcher needs to trace the source. A downstream GDAL/rasterio
+    tool converting this into a GeoTIFF or KMZ needs the explicit CRS
+    and corner order stated (both included below) and should not assume
+    the raster's pixel orientation matches these corners without
+    checking -- USGS does not record the scan's physical orientation.
+    """
+    corners = frame.footprint  # (NW, NE, SE, SW), each (longitude, latitude)
+    corner_labels = ("NW_CORNER", "NE_CORNER", "SE_CORNER", "SW_CORNER")
+    if corners:
+        corner_lines = [
+            f"{label}: {longitude:.6f}, {latitude:.6f}"
+            for label, (longitude, latitude) in zip(corner_labels, corners, strict=True)
+        ]
+        center_lon = sum(longitude for longitude, _ in corners) / len(corners)
+        center_lat = sum(latitude for _, latitude in corners) / len(corners)
+        center_line = f"CENTER: {center_lon:.6f}, {center_lat:.6f}"
+    else:
+        corner_lines = [f"{label}: unknown" for label in corner_labels]
+        center_line = "CENTER: unknown"
+    acquisition = frame.acquisition_date.isoformat() if frame.acquisition_date else "unknown"
+    lines = [
+        "---USGS HISTORICAL METADATA---",
+        f"ENTITY_ID: {frame.entity_id or 'unknown'}",
+        f"DISPLAY_ID: {frame.display_id or 'unknown'}",
+        f"ACQUISITION_DATE: {acquisition}",
+        f"AGENCY: {frame.agency or 'unknown'}",
+        f"PROJECT: {frame.project or 'unknown'}",
+        f"ROLL: {frame.roll or 'unknown'}",
+        f"FRAME: {frame.frame or 'unknown'}",
+        f"SCALE: {frame.scale or 'unknown'}",
+        f"IMAGE_TYPE: {frame.image_type or 'unknown'}",
+        f"QUALITY: {frame.quality or 'unknown'}",
+        *corner_lines,
+        center_line,
+        "CORNER_ORDER: NW, NE, SE, SW (longitude, latitude)",
+        "SOURCE_CRS: EPSG:4326 (WGS 84)",
+        "NOTE: Footprint corners are USGS's nominal photographed-ground-area "
+        "coordinates, not a verified pixel-to-ground mapping. Confirm scan "
+        "orientation (rotation/flip) before using these corners as GCPs.",
+        f"SOURCE: {APP_NAME}",
+        "------------------------------",
+    ]
+    return "\n".join(lines)
+
+
+def embed_tiff_metadata(
+    source: Path, destination: Path, frame: AerialFrame, cancel: threading.Event,
+) -> Path:
+    """Write ``source`` to ``destination`` with the USGS metadata block
+    embedded in the TIFF ImageDescription tag. Raises ApiError (without
+    touching ``source``) if the image cannot be decoded/re-encoded; the
+    caller should fall back to a plain byte copy rather than fail the
+    whole save over a missing metadata tag."""
+    if cancel.is_set():
+        raise ApiError("Cancelled", "Save cancelled.")
+    partial = destination.with_name(destination.name + ".part")
+    try:
+        with Image.open(source) as image:
+            image.load()
+            if cancel.is_set():
+                raise ApiError("Cancelled", "Save cancelled.")
+            save_kwargs: dict[str, Any] = {}
+            compression = image.info.get("compression")
+            if compression and compression != "raw":
+                save_kwargs["compression"] = compression
+            image.save(
+                partial, format="TIFF",
+                tiffinfo={270: build_metadata_block(frame)},
+                **save_kwargs,
+            )
+        partial.replace(destination)
+        LOG.info("Embedded USGS metadata in saved TIFF: entity=%s path=%s",
+                 frame.entity_id, destination.name)
+        return destination
+    except ApiError:
+        partial.unlink(missing_ok=True)
+        raise
+    except (OSError, ValueError, UnidentifiedImageError) as exc:
+        partial.unlink(missing_ok=True)
+        raise ApiError(
+            "Filesystem",
+            "The USGS metadata could not be embedded in the saved TIFF.",
+            str(exc),
+        ) from exc
+
+
 class ViewerCache:
     def __init__(self) -> None:
         self._temporary = tempfile.TemporaryDirectory(prefix="aerial-archive-")
@@ -1029,27 +1123,38 @@ class ImageViewer:
         self.window.title(f"{APP_NAME} — Viewer — {label}")
         self.window.geometry("1100x760")
         self.window.minsize(650, 450)
-        self.path, self.product, self.cache, self.cache_key = image_path, product, cache, cache_key
-        self.image = Image.open(image_path)
-        self.image.load()
+        self.frame, self.path, self.product = frame, image_path, product
+        self.cache, self.cache_key = cache, cache_key
+        self._source_image = Image.open(image_path)
+        self._source_image.load()
+        self.rotation = 0  # degrees counter-clockwise applied for display: 0/90/180/270
+        self.image = self._source_image
         self.photo: ImageTk.PhotoImage | None = None
         self.scale, self.min_scale, self.max_scale = 1.0, 0.01, 10.0
         self.offset_x = self.offset_y = 0.0
         self._pan: tuple[int, int] | None = None
         self._redraw_id: str | None = None
         self._quality_id: str | None = None
+        self._save_cancel: threading.Event | None = None
 
         bar = ttk.Frame(self.window, padding=(8, 6))
         bar.pack(fill=tk.X)
         prefix = "Browse quality — " if browse_quality else ""
         ttk.Label(bar, text=f"{prefix}{product.name} • {product.size_text}").pack(side=tk.LEFT, padx=(0, 12))
+        self.save_button: ttk.Button | None = None
         for text, command in (("Zoom +", lambda: self.zoom_center(1.2)),
                               ("Zoom −", lambda: self.zoom_center(1 / 1.2)),
-                              ("Fit to Window", self.fit), ("Save Image", self.save),
+                              ("Fit to Window", self.fit),
+                              ("Rotate Left 90°", lambda: self.rotate(90)),
+                              ("Rotate 180°", lambda: self.rotate(180)),
+                              ("Rotate Right 90°", lambda: self.rotate(-90)),
+                              ("Save Image", self.save),
                               ("Close", self.close)):
             button = ttk.Button(bar, text=text, command=command)
-            if text == "Save Image" and browse_quality:
-                button.configure(state=tk.DISABLED)
+            if text == "Save Image":
+                self.save_button = button
+                if browse_quality:
+                    button.configure(state=tk.DISABLED)
             button.pack(side=tk.LEFT, padx=3)
         self.zoom_var = tk.StringVar(value="100%")
         ttk.Label(bar, textvariable=self.zoom_var).pack(side=tk.RIGHT)
@@ -1081,6 +1186,25 @@ class ImageViewer:
         self.offset_x = (width - iw * self.scale) / 2
         self.offset_y = (height - ih * self.scale) / 2
         self.redraw()
+
+    def rotate(self, delta: int) -> None:
+        """Rotate the displayed image by ``delta`` degrees (positive =
+        counter-clockwise "left", negative = clockwise "right").
+
+        View-only: re-derived from the untouched source image each time
+        (so repeated rotation never drifts or loses quality), and does
+        not affect what Save Image writes -- that always saves the
+        original downloaded bytes, matching every other saved output in
+        this app.
+        """
+        self.rotation = (self.rotation + delta) % 360
+        transpose = {
+            90: Image.Transpose.ROTATE_90,
+            180: Image.Transpose.ROTATE_180,
+            270: Image.Transpose.ROTATE_270,
+        }.get(self.rotation)
+        self.image = self._source_image if transpose is None else self._source_image.transpose(transpose)
+        self.fit()
 
     def zoom_center(self, factor: float) -> None:
         self.zoom_at(self.canvas.winfo_width() / 2, self.canvas.winfo_height() / 2, factor)
@@ -1164,9 +1288,11 @@ class ImageViewer:
         self.zoom_var.set(f"{self.scale * 100:.0f}%")
 
     def save(self) -> None:
-        filename = sanitize_filename(self.path.name)
-        selected = filedialog.asksaveasfilename(parent=self.window, initialfile=filename,
-                                                defaultextension=self.path.suffix)
+        filename = sanitize_filename(f"{self.frame.entity_id}.tif")
+        selected = filedialog.asksaveasfilename(
+            parent=self.window, initialfile=filename, defaultextension=".tif",
+            filetypes=(("TIFF image", "*.tif"), ("All files", "*.*")),
+        )
         if not selected:
             return
         destination = Path(selected)
@@ -1174,19 +1300,58 @@ class ImageViewer:
             return
         if destination.exists():
             destination.unlink()
+        if self.save_button:
+            self.save_button.configure(state=tk.DISABLED)
+        self._save_cancel = threading.Event()
+        threading.Thread(
+            target=self._save_worker, args=(destination, self._save_cancel), daemon=True,
+        ).start()
+
+    def _save_worker(self, destination: Path, cancel: threading.Event) -> None:
+        embedded = True
+        error: ApiError | None = None
         try:
-            self.cache.copy_to(self.cache_key, destination)
-            messagebox.showinfo(APP_NAME, f"Image saved to:\n{destination}", parent=self.window)
+            cached = self.cache.get(self.cache_key)
+            if not cached:
+                raise ApiError("Filesystem", "The cached image is no longer available.")
+            try:
+                embed_tiff_metadata(cached, destination, self.frame, cancel)
+                self.cache.record_saved(self.cache_key, destination)
+            except ApiError as exc:
+                if exc.category == "Cancelled":
+                    raise
+                embedded = False
+                LOG.warning(
+                    "Metadata embedding failed; saving original TIFF unchanged: %s",
+                    exc.message,
+                )
+                self.cache.copy_to(self.cache_key, destination)
         except ApiError as exc:
-            messagebox.showerror(APP_NAME, exc.message, parent=self.window)
+            error = exc
+        except (OSError, ValueError) as exc:
+            error = ApiError("Filesystem", "The image could not be saved.", str(exc))
+        if self.window.winfo_exists():
+            self.window.after(0, self._save_finished, destination, embedded, error)
+
+    def _save_finished(self, destination: Path, embedded: bool, error: ApiError | None) -> None:
+        if self.save_button and self.save_button.winfo_exists():
+            self.save_button.configure(state=tk.NORMAL)
+        if error:
+            if error.category != "Cancelled":
+                messagebox.showerror(error.category, error.message, parent=self.window)
+            return
+        suffix = "" if embedded else "\n\n(USGS metadata could not be embedded; original TIFF saved unchanged.)"
+        messagebox.showinfo(APP_NAME, f"Image saved to:\n{destination}{suffix}", parent=self.window)
 
     def close(self) -> None:
         if self._redraw_id:
             self.window.after_cancel(self._redraw_id)
         if self._quality_id:
             self.window.after_cancel(self._quality_id)
+        if self._save_cancel:
+            self._save_cancel.set()
         self.photo = None
-        self.image.close()
+        self._source_image.close()
         self.window.destroy()
 
 
@@ -1710,7 +1875,10 @@ class AerialArchiveExplorerApp:
                 except (OSError, UnidentifiedImageError) as exc:
                     messagebox.showerror(APP_NAME, f"The downloaded image could not be opened:\n{exc}", parent=self.root)
             else:
-                self._choose_and_copy(key, path.name)
+                self._choose_and_copy(key, frame)
+        elif kind == "saved_copy":
+            _destination, embedded = value
+            self._set_ready("Complete" if embedded else "Complete — saved without embedded metadata")
         elif kind == "browse_viewer":
             path, frame, product, key = value
             self.cache.record_cache(key, path)
@@ -1917,7 +2085,7 @@ class AerialArchiveExplorerApp:
                 except (OSError, UnidentifiedImageError) as exc:
                     messagebox.showerror(APP_NAME, str(exc), parent=self.root)
             else:
-                self._choose_and_copy(key, cached.name)
+                self._choose_and_copy(key, frame)
             return
         if not messagebox.askokcancel(APP_NAME,
                 f"Download {product.name} ({product.size_text})?\n\nThe file will be cached for this app session.", parent=self.root):
@@ -1945,8 +2113,12 @@ class AerialArchiveExplorerApp:
         except Exception as exc:
             self.events.put(("error", (generation, self._safe_error(exc))))
 
-    def _choose_and_copy(self, key: tuple[str, str, str], filename: str) -> None:
-        selected = filedialog.asksaveasfilename(parent=self.root, initialfile=sanitize_filename(filename))
+    def _choose_and_copy(self, key: tuple[str, str, str], frame: AerialFrame) -> None:
+        filename = sanitize_filename(f"{frame.entity_id}.tif")
+        selected = filedialog.asksaveasfilename(
+            parent=self.root, initialfile=filename, defaultextension=".tif",
+            filetypes=(("TIFF image", "*.tif"), ("All files", "*.*")),
+        )
         if not selected:
             return
         destination = Path(selected)
@@ -1954,11 +2126,36 @@ class AerialArchiveExplorerApp:
             return
         if destination.exists():
             destination.unlink()
+        self.cancel = threading.Event()
+        self._set_busy("Saving…")
+        generation = self.generation
+        threading.Thread(
+            target=self._save_copy_worker, args=(key, frame, destination, generation, self.cancel),
+            daemon=True,
+        ).start()
+
+    def _save_copy_worker(self, key: tuple[str, str, str], frame: AerialFrame,
+                          destination: Path, generation: int, cancel: threading.Event) -> None:
         try:
-            self.cache.copy_to(key, destination)
-            self.status_var.set("Complete")
-        except ApiError as exc:
-            messagebox.showerror(exc.category, exc.message, parent=self.root)
+            cached = self.cache.get(key)
+            if not cached:
+                raise ApiError("Filesystem", "The cached image is no longer available.")
+            embedded = True
+            try:
+                embed_tiff_metadata(cached, destination, frame, cancel)
+                self.cache.record_saved(key, destination)
+            except ApiError as exc:
+                if exc.category == "Cancelled":
+                    raise
+                embedded = False
+                LOG.warning(
+                    "Metadata embedding failed; saving original TIFF unchanged: %s",
+                    exc.message,
+                )
+                self.cache.copy_to(key, destination)
+            self.events.put(("saved_copy", (generation, (destination, embedded))))
+        except Exception as exc:
+            self.events.put(("error", (generation, self._safe_error(exc))))
 
     def close(self) -> None:
         LOG.info("Application shutdown requested.")

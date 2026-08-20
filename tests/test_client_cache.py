@@ -6,10 +6,12 @@ import pytest
 from PIL import Image
 
 from aerial_archive_explorer import (
+    AerialFrame,
     ApiError,
     SearchQuery,
     UsgsM2MClient,
     ViewerCache,
+    embed_tiff_metadata,
     prepare_viewable_image,
     stream_download,
 )
@@ -254,6 +256,51 @@ def test_viewer_cache_reuse_save_and_cleanup(tmp_path):
     cache.close()
     assert saved.exists()
     assert not temporary_root.exists()
+
+
+def test_embed_tiff_metadata_writes_description_and_preserves_pixels(tmp_path):
+    import numpy as np
+
+    source = tmp_path / "frame_original.tif"
+    pixels = np.arange(12, dtype="uint8").reshape(3, 4)
+    Image.fromarray(pixels, mode="L").save(source, format="TIFF")
+    frame = AerialFrame(
+        entity_id="AR1VXA000010011", display_id="1VXA000010011",
+        acquisition_date=None,
+        footprint=((-94.0, 38.0), (-92.0, 38.0), (-92.0, 36.0), (-94.0, 36.0)),
+    )
+    destination = tmp_path / "AR1VXA000010011.tif"
+    embed_tiff_metadata(source, destination, frame, threading.Event())
+    assert source.exists()  # source untouched
+    with Image.open(destination) as saved:
+        assert np.array_equal(np.array(saved), pixels)
+        description = saved.tag_v2[270]
+    assert "ENTITY_ID: AR1VXA000010011" in description
+    assert "---USGS HISTORICAL METADATA---" in description
+
+
+def test_embed_tiff_metadata_cancelled_leaves_no_partial(tmp_path):
+    source = tmp_path / "frame_original.tif"
+    Image.new("L", (4, 3), 100).save(source, format="TIFF")
+    frame = AerialFrame(entity_id="E1", display_id="E1")
+    destination = tmp_path / "E1.tif"
+    cancelled = threading.Event()
+    cancelled.set()
+    with pytest.raises(ApiError, match="cancelled"):
+        embed_tiff_metadata(source, destination, frame, cancelled)
+    assert not destination.exists()
+    assert not (tmp_path / (destination.name + ".part")).exists()
+
+
+def test_embed_tiff_metadata_rejects_non_image_without_touching_source(tmp_path):
+    source = tmp_path / "not-an-image.tif"
+    source.write_bytes(b"plain text, not a TIFF")
+    frame = AerialFrame(entity_id="E1", display_id="E1")
+    destination = tmp_path / "E1.tif"
+    with pytest.raises(ApiError, match="metadata could not be embedded"):
+        embed_tiff_metadata(source, destination, frame, threading.Event())
+    assert source.read_bytes() == b"plain text, not a TIFF"
+    assert not destination.exists()
 
 
 def test_cache_never_overwrites(tmp_path):
