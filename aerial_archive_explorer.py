@@ -192,6 +192,7 @@ class AerialFrame:
     coordinates: str = ""
     browse_url: str = ""
     download_hint: str = ""
+    footprint: tuple[tuple[float, float], ...] | None = None
     details: dict[str, str] = field(default_factory=dict)
 
     @property
@@ -225,6 +226,8 @@ class SearchResult:
     total_hits: int
     capped: bool
     dataset_alias: str
+    candidate_count: int = 0
+    invalid_footprints: int = 0
 
 
 # Pure helpers
@@ -352,6 +355,94 @@ def _lookup(values: Mapping[str, str], *names: str) -> str:
     return ""
 
 
+def polygon_area(footprint: tuple[tuple[float, float], ...]) -> float:
+    """Signed area of a footprint polygon via the shoelace formula."""
+    total = 0.0
+    count = len(footprint)
+    for index in range(count):
+        x1, y1 = footprint[index]
+        x2, y2 = footprint[(index + 1) % count]
+        total += x1 * y2 - x2 * y1
+    return total / 2.0
+
+
+def point_in_footprint(
+    latitude: float, longitude: float,
+    footprint: tuple[tuple[float, float], ...] | None,
+) -> bool:
+    """Return True when (latitude, longitude) is inside or on the boundary
+    of a valid four-corner footprint polygon."""
+    if not footprint or len(footprint) != 4 or abs(polygon_area(footprint)) < 1e-12:
+        return False
+    point_x, point_y = longitude, latitude
+    count = len(footprint)
+    for index in range(count):
+        x1, y1 = footprint[index]
+        x2, y2 = footprint[(index + 1) % count]
+        cross = (x2 - x1) * (point_y - y1) - (y2 - y1) * (point_x - x1)
+        if (abs(cross) < 1e-9
+                and min(x1, x2) - 1e-9 <= point_x <= max(x1, x2) + 1e-9
+                and min(y1, y2) - 1e-9 <= point_y <= max(y1, y2) + 1e-9):
+            return True
+    inside = False
+    for index in range(count):
+        x1, y1 = footprint[index]
+        x2, y2 = footprint[(index + 1) % count]
+        if (y1 > point_y) != (y2 > point_y):
+            intersect_x = x1 + (point_y - y1) * (x2 - x1) / (y2 - y1)
+            if point_x < intersect_x:
+                inside = not inside
+    return inside
+
+
+def _corner_label_matches(label: str, corner: str, axis: str) -> bool:
+    lowered = label.casefold()
+    compact = re.sub(r"[^a-z0-9]", "", lowered)
+    corner_names = {
+        "nw": ("northwest", "nw"), "ne": ("northeast", "ne"),
+        "se": ("southeast", "se"), "sw": ("southwest", "sw"),
+    }[corner]
+    has_corner = corner_names[0] in compact or bool(
+        re.search(rf"\b{corner_names[1]}\b", lowered)
+    )
+    if axis == "lat":
+        has_axis = "latitude" in compact or bool(re.search(r"\blat\b", lowered))
+    else:
+        has_axis = any(word in compact for word in ("longitude", "long", "lon"))
+    return has_corner and has_axis
+
+
+def extract_frame_footprint(
+    metadata: Mapping[str, str],
+) -> tuple[tuple[float, float], ...] | None:
+    """Extract the USGS frame's four corners (NW, NE, SE, SW) as a footprint
+    polygon of (longitude, latitude) tuples, or None when incomplete/invalid."""
+    corners: list[tuple[float, float]] = []
+    for corner in ("nw", "ne", "se", "sw"):
+        latitude: float | None = None
+        longitude: float | None = None
+        for label, raw_value in metadata.items():
+            try:
+                value = float(str(raw_value).strip())
+            except (TypeError, ValueError):
+                continue
+            if _corner_label_matches(label, corner, "lat"):
+                latitude = value
+            elif _corner_label_matches(label, corner, "lon"):
+                longitude = value
+        if latitude is None or longitude is None:
+            return None
+        if not (math.isfinite(latitude) and math.isfinite(longitude)):
+            return None
+        if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
+            return None
+        corners.append((longitude, latitude))
+    footprint = tuple(corners)
+    if len(set(footprint)) < 4 or abs(polygon_area(footprint)) < 1e-12:
+        return None
+    return footprint
+
+
 def normalize_scene(scene: Mapping[str, Any]) -> AerialFrame:
     meta = metadata_map(scene)
     entity_id = str(scene.get("entityId") or scene.get("entityID") or "").strip()
@@ -379,6 +470,7 @@ def normalize_scene(scene: Mapping[str, Any]) -> AerialFrame:
         coordinates=_lookup(meta, "Coordinates - Decimal Degrees", "Center Coordinate") or str(spatial or ""),
         browse_url=browse,
         download_hint=_lookup(meta, "High Resolution Download Available", "Download Available"),
+        footprint=extract_frame_footprint(meta),
         details=meta,
     )
 
@@ -631,8 +723,21 @@ class UsgsM2MClient:
             if len(unique) >= cap:
                 capped = True
                 break
-        frames = sorted(unique.values(), key=frame_sort_key)
-        return SearchResult(frames, total_hits, capped or total_hits > len(frames), alias)
+        candidates = list(unique.values())
+        covering = [
+            frame for frame in candidates
+            if point_in_footprint(query.latitude, query.longitude, frame.footprint)
+        ]
+        invalid_footprints = sum(1 for frame in candidates if not frame.footprint)
+        frames = sorted(covering, key=frame_sort_key)
+        LOG.info(
+            "Footprint coverage filter: candidates=%d retained=%d invalid_geometry=%d",
+            len(candidates), len(frames), invalid_footprints,
+        )
+        return SearchResult(
+            frames, total_hits, capped or total_hits > len(candidates), alias,
+            candidate_count=len(candidates), invalid_footprints=invalid_footprints,
+        )
 
     def download_options(self, dataset: str, entity_id: str) -> list[DownloadProduct]:
         data = self.request("download-options", {"datasetName": dataset, "entityIds": [entity_id]})
@@ -1110,7 +1215,6 @@ class AerialArchiveExplorerApp:
         self.frames: list[AerialFrame] = []
         self.products: list[DownloadProduct] = []
         self.selected: AerialFrame | None = None
-        self.preview_photo: ImageTk.PhotoImage | None = None
         self._sort_column, self._sort_reverse = "date", False
         self._busy = False
         self._build()
@@ -1174,7 +1278,7 @@ class AerialArchiveExplorerApp:
         ttk.Label(form, text="Radius is a catalog tolerance, not a guarantee that the point appears in the scan.",
                   foreground="#555555").grid(row=2, column=0, columnspan=9, pady=(7, 0))
 
-        results = ttk.LabelFrame(outer, text="Matching aerial frames", padding=6)
+        results = ttk.LabelFrame(outer, text="Aerial frames covering this coordinate", padding=6)
         results.grid(row=2, column=0, sticky="nsew")
         results.rowconfigure(0, weight=1)
         results.columnconfigure(0, weight=1)
@@ -1190,30 +1294,33 @@ class AerialArchiveExplorerApp:
         yscroll.grid(row=0, column=1, sticky="ns")
         xscroll.grid(row=1, column=0, sticky="ew")
         self.tree.bind("<<TreeviewSelect>>", self.select_frame)
-        self.tree.bind("<Double-1>", lambda _event: self.load_preview())
         self.count_var = tk.StringVar(value="No search yet.")
         ttk.Label(results, textvariable=self.count_var).grid(row=2, column=0, sticky="w", pady=(4, 0))
 
         lower = ttk.Panedwindow(outer, orient=tk.HORIZONTAL)
         lower.grid(row=3, column=0, sticky="nsew", pady=(8, 0))
         details_frame = ttk.LabelFrame(lower, text="Selected frame details", padding=7)
-        preview_frame = ttk.LabelFrame(lower, text="Quick Preview — lower-resolution unrectified browse", padding=7)
+        actions_frame = ttk.LabelFrame(lower, text="View & download", padding=7)
         lower.add(details_frame, weight=3)
-        lower.add(preview_frame, weight=2)
+        lower.add(actions_frame, weight=2)
         self.details = tk.Text(details_frame, height=9, wrap=tk.WORD, state=tk.DISABLED)
         self.details.pack(fill=tk.BOTH, expand=True)
-        self.preview_label = ttk.Label(preview_frame, text="Select a frame to inspect it.", anchor=tk.CENTER)
-        self.preview_label.pack(fill=tk.BOTH, expand=True)
-        actions = ttk.Frame(preview_frame)
-        actions.pack(fill=tk.X, pady=(7, 0))
-        self.preview_button = ttk.Button(actions, text="Quick Preview", command=self.load_preview, state=tk.DISABLED)
-        self.viewer_button = ttk.Button(actions, text="Open Best Image in Viewer", command=self.open_best, state=tk.DISABLED)
-        self.save_button = ttk.Button(actions, text="Download / Save As", command=self.save_as, state=tk.DISABLED)
-        for button in (self.preview_button, self.viewer_button, self.save_button):
+        ttk.Label(
+            actions_frame,
+            text="Every listed frame's footprint covers the searched coordinate.",
+            foreground="#555555", wraplength=430, justify=tk.LEFT,
+        ).pack(fill=tk.X, anchor=tk.W)
+        self.product_var = tk.StringVar(value="Select a frame to check download products.")
+        ttk.Label(actions_frame, textvariable=self.product_var, wraplength=430, justify=tk.LEFT).pack(
+            fill=tk.X, anchor=tk.W, pady=(6, 10),
+        )
+        actions = ttk.Frame(actions_frame)
+        actions.pack(fill=tk.X)
+        self.viewer_button = ttk.Button(actions, text="View Aerial", command=self.open_best, state=tk.DISABLED)
+        self.save_button = ttk.Button(actions, text="Download", command=self.save_as, state=tk.DISABLED)
+        for button in (self.viewer_button, self.save_button):
             button.pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(actions, text="Open in EarthExplorer", command=lambda: webbrowser.open(EARTH_EXPLORER_URL)).pack(side=tk.RIGHT)
-        self.product_var = tk.StringVar(value="Select a frame to check download products.")
-        ttk.Label(preview_frame, textvariable=self.product_var, wraplength=430).pack(fill=tk.X, pady=(5, 0))
 
         status = ttk.Frame(outer)
         status.grid(row=4, column=0, sticky="ew", pady=(8, 0))
@@ -1380,10 +1487,7 @@ class AerialArchiveExplorerApp:
         self.tree.delete(*self.tree.get_children())
         self.count_var.set("No search yet.")
         self._details("")
-        self.preview_photo = None
-        self.preview_label.configure(image="", text="Select a frame to inspect it.")
-        self.preview_button.configure(state=tk.DISABLED)
-        self.viewer_button.configure(state=tk.DISABLED, text="Open Best Image in Viewer")
+        self.viewer_button.configure(state=tk.DISABLED, text="View Aerial")
         self.save_button.configure(state=tk.DISABLED)
         self.product_var.set("Select a frame to check download products.")
         self._set_ready("Signed out")
@@ -1581,9 +1685,6 @@ class AerialArchiveExplorerApp:
             self.frames, self.dataset_alias = value.frames, value.dataset_alias
             self._populate(value)
             self._set_ready("Complete" if value.frames else "No matches")
-        elif kind == "preview":
-            self._show_preview(value)
-            self._set_ready("Complete")
         elif kind == "products":
             entity_id, products = value
             if not self.selected or self.selected.entity_id != entity_id:
@@ -1594,7 +1695,7 @@ class AerialArchiveExplorerApp:
                                  "No immediately downloadable scan. Use EarthExplorer to review options.")
             browse_fallback = bool(self.selected.browse_url)
             self.viewer_button.configure(
-                text="Open Best Image in Viewer" if chosen else "View Browse Image Instead",
+                text="View Aerial" if chosen else "View Browse Image Instead",
                 state=tk.NORMAL if chosen or browse_fallback else tk.DISABLED,
             )
             self.save_button.configure(state=tk.NORMAL if chosen else tk.DISABLED)
@@ -1651,11 +1752,15 @@ class AerialArchiveExplorerApp:
             self.tree.insert("", tk.END, iid=str(index), values=values)
         shown = len(self.frames)
         suffix = "; list capped—narrow the radius" if result.capped else ""
-        self.count_var.set(f"{result.total_hits} matches; showing {shown}{suffix}")
+        if result.candidate_count > shown:
+            self.count_var.set(
+                f"{shown} frame(s) cover this exact coordinate "
+                f"({result.candidate_count} candidate scene(s) checked){suffix}"
+            )
+        else:
+            self.count_var.set(f"{shown} frame(s) cover this exact coordinate{suffix}")
         self.selected = None
         self.products = []
-        self.preview_photo = None
-        self.preview_label.configure(image="", text="Select a frame to inspect it.")
         self._details("")
 
     def sort(self, column: str) -> None:
@@ -1667,7 +1772,10 @@ class AerialArchiveExplorerApp:
                 return frame.acquisition_date or (dt.date.min if reverse else dt.date.max)
             return str(getattr(frame, column, "") or "").casefold()
         self.frames.sort(key=lambda frame: (key(frame), frame.display_id.casefold()), reverse=reverse)
-        self._populate(SearchResult(self.frames, len(self.frames), False, self.dataset_alias))
+        self._populate(SearchResult(
+            self.frames, len(self.frames), False, self.dataset_alias,
+            candidate_count=len(self.frames),
+        ))
         for iid, frame in enumerate(self.frames):
             if frame.entity_id == selected_entity:
                 self.tree.selection_set(str(iid))
@@ -1690,11 +1798,7 @@ class AerialArchiveExplorerApp:
             if label.casefold() not in known:
                 lines.append(f"{label}: {value}")
         self._details("\n".join(lines))
-        self.preview_photo = None
-        self.preview_label.configure(image="", text="Browse available." if frame.browse_url else "No browse image supplied by USGS.")
-        self.preview_button.configure(state=tk.NORMAL if frame.browse_url else tk.DISABLED)
-        self.viewer_button.configure(state=tk.DISABLED)
-        self.viewer_button.configure(text="Open Best Image in Viewer")
+        self.viewer_button.configure(state=tk.DISABLED, text="View Aerial")
         self.save_button.configure(state=tk.DISABLED)
         self.product_var.set("Checking available products…")
         generation = self.generation
@@ -1712,33 +1816,6 @@ class AerialArchiveExplorerApp:
             self.events.put(("products", (generation, (frame.entity_id, products))))
         except Exception as exc:
             self.events.put(("error", (generation, self._safe_error(exc))))
-
-    def load_preview(self) -> None:
-        if not self.selected or not self.selected.browse_url:
-            return
-        frame, generation = self.selected, self.generation
-        self._set_busy("Loading preview…")
-        threading.Thread(target=self._preview_worker, args=(frame, generation, self.cancel), daemon=True).start()
-
-    def _preview_worker(self, frame: AerialFrame, generation: int, cancel: threading.Event) -> None:
-        try:
-            data = fetch_bytes(frame.browse_url, cancel)
-            self.events.put(("preview", (generation, (frame.entity_id, data))))
-        except Exception as exc:
-            self.events.put(("error", (generation, self._safe_error(exc))))
-
-    def _show_preview(self, value: tuple[str, bytes]) -> None:
-        import io
-        entity, data = value
-        if not self.selected or self.selected.entity_id != entity:
-            return
-        try:
-            image = Image.open(io.BytesIO(data))
-            image.thumbnail((480, 230), Image.Resampling.LANCZOS)
-            self.preview_photo = ImageTk.PhotoImage(image)
-            self.preview_label.configure(image=self.preview_photo, text="")
-        except (OSError, UnidentifiedImageError) as exc:
-            raise ApiError("Preview", "The browse image format is unsupported or corrupt.", str(exc)) from exc
 
     def open_best(self) -> None:
         if best_product(self.products):

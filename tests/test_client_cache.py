@@ -15,6 +15,21 @@ from aerial_archive_explorer import (
 )
 
 
+def footprint_metadata(latitude=37.0, longitude=-93.0, delta=0.1):
+    """A four-corner footprint (as USGS metadata fields) that covers
+    (latitude, longitude) with room to spare on every side."""
+    return [
+        {"fieldName": "NW Corner Latitude", "value": latitude + delta},
+        {"fieldName": "NW Corner Longitude", "value": longitude - delta},
+        {"fieldName": "NE Corner Latitude", "value": latitude + delta},
+        {"fieldName": "NE Corner Longitude", "value": longitude + delta},
+        {"fieldName": "SE Corner Latitude", "value": latitude - delta},
+        {"fieldName": "SE Corner Longitude", "value": longitude + delta},
+        {"fieldName": "SW Corner Latitude", "value": latitude - delta},
+        {"fieldName": "SW Corner Longitude", "value": longitude - delta},
+    ]
+
+
 class FakeTransport:
     def __init__(self):
         self.calls = []
@@ -29,9 +44,9 @@ class FakeTransport:
         if endpoint == "scene-search":
             start = payload["startingNumber"]
             records = ([{"entityId": "E1", "displayId": "P1",
-                         "acquisitionDate": "1940-01-01", "metadata": []},
+                         "acquisitionDate": "1940-01-01", "metadata": footprint_metadata()},
                         {"entityId": "E2", "displayId": "P2",
-                         "acquisitionDate": "1950-01-01", "metadata": []}]
+                         "acquisitionDate": "1950-01-01", "metadata": footprint_metadata()}]
                        if start == 1 else [])
             return {"data": {"results": records, "totalHits": 2,
                              "recordsReturned": len(records)}, "errorCode": None}
@@ -86,7 +101,8 @@ def test_search_cap():
             if endpoint == "scene-search":
                 count = payload["maxResults"]
                 return {"data": {"results": [
-                    {"entityId": f"E{payload['startingNumber'] + i}", "metadata": []}
+                    {"entityId": f"E{payload['startingNumber'] + i}",
+                     "metadata": footprint_metadata(0.0, 0.0)}
                     for i in range(count)], "totalHits": 1000,
                     "recordsReturned": count}, "errorCode": None}
             return super().__call__(endpoint, payload, key)
@@ -95,6 +111,32 @@ def test_search_cap():
     result = client.search(SearchQuery(0, 0, 1), threading.Event(), cap=3)
     assert len(result.frames) == 3
     assert result.capped
+
+
+def test_search_excludes_neighboring_and_footprintless_candidates():
+    class MixedTransport(FakeTransport):
+        def __call__(self, endpoint, payload, key):
+            if endpoint == "scene-search":
+                records = [
+                    # Covers the searched point (37, -93).
+                    {"entityId": "COVERS", "metadata": footprint_metadata(37.0, -93.0)},
+                    # A real neighboring frame whose footprint does not
+                    # reach the searched point at all.
+                    {"entityId": "NEIGHBOR", "metadata": footprint_metadata(37.0, -90.0)},
+                    # Matched the MBR radius search but has no usable
+                    # corner metadata to confirm coverage either way.
+                    {"entityId": "NO_FOOTPRINT", "metadata": []},
+                ]
+                return {"data": {"results": records, "totalHits": len(records),
+                                 "recordsReturned": len(records)}, "errorCode": None}
+            return super().__call__(endpoint, payload, key)
+
+    client = UsgsM2MClient(transport=MixedTransport(), sleep=lambda _: None)
+    client.api_key = "session"
+    result = client.search(SearchQuery(37, -93, 1), threading.Event())
+    assert [frame.entity_id for frame in result.frames] == ["COVERS"]
+    assert result.candidate_count == 3
+    assert result.invalid_footprints == 1
 
 
 def test_prepared_download_retrieve_contract(monkeypatch):

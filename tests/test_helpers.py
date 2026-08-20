@@ -14,6 +14,7 @@ from aerial_archive_explorer import (
     best_product,
     classify_product,
     coordinate_boxes,
+    extract_frame_footprint,
     frame_sort_key,
     match_aerial_dataset,
     normalize_scene,
@@ -21,6 +22,8 @@ from aerial_archive_explorer import (
     parse_envelope,
     parse_finite_number,
     parse_radius,
+    point_in_footprint,
+    polygon_area,
     redact,
     sanitize_filename,
     tls_context,
@@ -129,6 +132,62 @@ def test_normalization_complete_sparse_and_unknown():
     sparse = normalize_scene({"entityId": "E2", "metadata": []})
     assert sparse.acquisition_date is None
     assert sorted([sparse, frame], key=frame_sort_key) == [frame, sparse]
+
+
+def test_extract_footprint_from_usgs_corner_metadata_and_reject_invalid():
+    metadata = {
+        "NW Corner Lat dec": "38.5", "NW Corner Long dec": "-94.5",
+        "NE Corner Lat dec": "38.5", "NE Corner Long dec": "-93.5",
+        "SE Corner Lat dec": "37.5", "SE Corner Long dec": "-93.5",
+        "SW Corner Lat dec": "37.5", "SW Corner Long dec": "-94.5",
+    }
+    assert extract_frame_footprint(metadata) == (
+        (-94.5, 38.5), (-93.5, 38.5), (-93.5, 37.5), (-94.5, 37.5),
+    )
+    incomplete = {"NW Corner Lat dec": "38.5", "NW Corner Long dec": "-94.5"}
+    assert extract_frame_footprint(incomplete) is None
+    out_of_range = {**metadata, "NW Corner Lat dec": "138.5"}
+    assert extract_frame_footprint(out_of_range) is None
+    degenerate = {name: "0" for name in metadata}
+    assert extract_frame_footprint(degenerate) is None
+
+
+def test_normalize_scene_extracts_footprint():
+    scene = {
+        "entityId": "E1", "metadata": [
+            {"fieldName": "NW Corner Lat dec", "value": "38.5"},
+            {"fieldName": "NW Corner Long dec", "value": "-94.5"},
+            {"fieldName": "NE Corner Lat dec", "value": "38.5"},
+            {"fieldName": "NE Corner Long dec", "value": "-93.5"},
+            {"fieldName": "SE Corner Lat dec", "value": "37.5"},
+            {"fieldName": "SE Corner Long dec", "value": "-93.5"},
+            {"fieldName": "SW Corner Lat dec", "value": "37.5"},
+            {"fieldName": "SW Corner Long dec", "value": "-94.5"},
+        ],
+    }
+    assert normalize_scene(scene).footprint == (
+        (-94.5, 38.5), (-93.5, 38.5), (-93.5, 37.5), (-94.5, 37.5),
+    )
+    assert normalize_scene({"entityId": "E2", "metadata": []}).footprint is None
+
+
+def test_point_in_footprint_inside_outside_boundary_and_invalid():
+    footprint = ((-94.0, 38.0), (-92.0, 38.0), (-92.0, 36.0), (-94.0, 36.0))
+    assert point_in_footprint(37.0, -93.0, footprint)  # interior
+    assert point_in_footprint(38.0, -93.0, footprint)  # on an edge (north)
+    assert point_in_footprint(38.0, -94.0, footprint)  # exactly on a corner
+    assert not point_in_footprint(39.0, -93.0, footprint)  # north of it
+    assert not point_in_footprint(37.0, -93.0, None)
+    degenerate = ((-94.0, 38.0), (-94.0, 38.0), (-94.0, 38.0), (-94.0, 38.0))
+    assert not point_in_footprint(37.0, -93.0, degenerate)
+    # A neighboring frame's footprint that never reaches the searched point.
+    neighbor = ((-92.0, 38.0), (-90.0, 38.0), (-90.0, 36.0), (-92.0, 36.0))
+    assert not point_in_footprint(37.0, -93.0, neighbor)
+
+
+def test_polygon_area_signed():
+    footprint = ((-94.0, 38.0), (-92.0, 38.0), (-92.0, 36.0), (-94.0, 36.0))
+    assert abs(polygon_area(footprint)) == pytest.approx(4.0)
 
 
 def product(name, available=True, order=False):
