@@ -56,6 +56,7 @@ POLL_LIMIT = 60
 EARTH_EXPLORER_URL = "https://earthexplorer.usgs.gov/"
 M2M_ACCESS_URL = "https://ers.cr.usgs.gov/profile/access"
 M2M_TOKEN_URL = "https://ers.cr.usgs.gov/profile/access"
+DONATE_URL = "https://www.paypal.com/paypalme/techbill"
 CREDENTIAL_SERVICE = "com.techbill.aerialarchiveexplorer.m2m"
 CREDENTIAL_USERNAME_KEY = "saved-usgs-username"
 MISSING = "—"
@@ -1572,6 +1573,7 @@ class AerialArchiveExplorerApp:
         for button in (self.viewer_button, self.save_button):
             button.pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(actions, text="Open in EarthExplorer", command=lambda: webbrowser.open(EARTH_EXPLORER_URL)).pack(side=tk.RIGHT)
+        self._build_donate_section(actions_frame)
 
         status = ttk.Frame(outer)
         status.grid(row=4, column=0, sticky="ew", pady=(8, 0))
@@ -1585,6 +1587,41 @@ class AerialArchiveExplorerApp:
         ttk.Button(status, text="View Logs", command=self.show_logs).grid(
             row=0, column=3, padx=(8, 0)
         )
+
+    def _build_donate_section(self, parent: tk.Misc) -> None:
+        """A centered, optional PayPal donation prompt below the action
+        buttons. Plain tk.Frame/tk.Label (not ttk.Button) so the PayPal
+        blue background renders reliably on macOS."""
+        donate = ttk.Frame(parent)
+        donate.pack(fill=tk.X, pady=(14, 0))
+        ttk.Label(
+            donate,
+            text="If you enjoy this application, please consider donating!",
+            justify=tk.CENTER, anchor=tk.CENTER,
+        ).pack(fill=tk.X)
+        button = tk.Frame(donate, bg="#0070BA", bd=1, relief="raised", cursor="hand2")
+        button.pack(pady=(8, 0))
+        label = tk.Label(
+            button, text="Donate on PayPal", bg="#0070BA", fg="white",
+            font=("TkDefaultFont", 10, "bold"), padx=20, pady=8,
+        )
+        label.pack()
+
+        def open_donate(_event: tk.Event | None = None) -> None:
+            webbrowser.open(DONATE_URL)
+
+        def on_enter(_event: tk.Event | None = None) -> None:
+            button.configure(bg="#005EA6")
+            label.configure(bg="#005EA6")
+
+        def on_leave(_event: tk.Event | None = None) -> None:
+            button.configure(bg="#0070BA")
+            label.configure(bg="#0070BA")
+
+        for widget in (button, label):
+            widget.bind("<Button-1>", open_donate)
+            widget.bind("<Enter>", on_enter)
+            widget.bind("<Leave>", on_leave)
 
     def _initialize_access(self) -> None:
         saved = None

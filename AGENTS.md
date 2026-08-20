@@ -360,6 +360,7 @@ Use native-looking `ttk` widgets and keyboard-accessible controls. A practical l
 - Read-only details panel for normalized and extra metadata.
 - A "View & download" panel: a short note that every listed frame covers the searched coordinate, the best-available product name/size summary, and exactly three buttons: **View Aerial** (opens the best downloadable scan in the viewer; falls back to **View Browse Image Instead** driven by downloadable-product availability, not browse availability), **Download** (product/destination selection, offered as `<entity_id>.tif`), and **Open in EarthExplorer**.
 - There is no dedicated preview pane/button in the main window.
+- Below those three buttons, `_build_donate_section()` adds a centered, optional PayPal donation prompt ("If you enjoy this application, please consider donating!" plus a blue **Donate on PayPal** button opening `DONATE_URL`). It's a plain `tk.Frame`/`tk.Label` pair with manual `<Button-1>`/`<Enter>`/`<Leave>` bindings and hover-color swap (`#0070BA` ↔ `#005EA6`) rather than a `ttk.Button`, matching the pattern in the sibling LiDAR Hillshade Explorer app — `ttk.Button` background styling is unreliable on macOS, so this is the deliberate, working alternative; don't "simplify" it back to a themed button without checking on macOS. Purely decorative/optional: no state, no effect on any workflow, safe to ignore in tests.
 
 ### Viewer window behavior
 
