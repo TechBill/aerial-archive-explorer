@@ -57,8 +57,8 @@ if sys.platform == "darwin":
         bundle_identifier="com.techbill.aerialarchiveexplorer",
         info_plist={
             "CFBundleDisplayName": "Aerial Archive Explorer",
-            "CFBundleShortVersionString": "2.0.2",
-            "CFBundleVersion": "2.0.2",
+            "CFBundleShortVersionString": "2.1.0",
+            "CFBundleVersion": "2.1.0",
             "NSHighResolutionCapable": True,
         },
     )

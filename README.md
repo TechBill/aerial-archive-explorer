@@ -1,4 +1,4 @@
-# Aerial Archive Explorer 2.0.2
+# Aerial Archive Explorer 2.1.0
 
 Search and download historic USGS aerial photographs by location.
 

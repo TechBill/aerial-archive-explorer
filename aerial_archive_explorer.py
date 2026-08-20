@@ -40,7 +40,7 @@ from PIL import Image, ImageTk, UnidentifiedImageError
 # Configuration and constants
 
 APP_NAME = "Aerial Archive Explorer"
-APP_VERSION = "2.0.2"
+APP_VERSION = "2.1.0"
 APP_SUBTITLE = "Search and download historic USGS aerial photographs by location."
 API_BASE = "https://m2m.cr.usgs.gov/api/api/json/stable/"
 USER_AGENT = f"AerialArchiveExplorer/{APP_VERSION} (+independent USGS catalog client)"
