@@ -39,9 +39,10 @@ from PIL import Image, ImageTk, UnidentifiedImageError
 # Configuration and constants
 
 APP_NAME = "Aerial Archive Explorer"
+APP_VERSION = "2.0.1"
 APP_SUBTITLE = "Search and download historic USGS aerial photographs by location."
 API_BASE = "https://m2m.cr.usgs.gov/api/api/json/stable/"
-USER_AGENT = "AerialArchiveExplorer/0.1 (+independent USGS catalog client)"
+USER_AGENT = f"AerialArchiveExplorer/{APP_VERSION} (+independent USGS catalog client)"
 REQUEST_TIMEOUT = 45
 PAGE_SIZE = 100
 SEARCH_CAP = 500
@@ -1383,8 +1384,8 @@ class AerialArchiveExplorerApp:
         self._sort_column, self._sort_reverse = "date", False
         self._busy = False
         self._build()
-        LOG.info("%s started: version=0.1.0 Python=%s OS=%s frozen=%s",
-                 APP_NAME, platform.python_version(), platform.platform(),
+        LOG.info("%s started: version=%s Python=%s OS=%s frozen=%s",
+                 APP_NAME, APP_VERSION, platform.python_version(), platform.platform(),
                  bool(getattr(__import__("sys"), "frozen", False)))
         LOG.info("API base: %s", API_BASE)
         self.root.after(80, self._poll)
@@ -1392,7 +1393,7 @@ class AerialArchiveExplorerApp:
         self.root.after_idle(self._initialize_access)
 
     def _build(self) -> None:
-        self.root.title(APP_NAME)
+        self.root.title(f"{APP_NAME} v{APP_VERSION}")
         self._set_window_icon()
         self.root.geometry("1280x820")
         self.root.minsize(980, 650)
@@ -1404,7 +1405,7 @@ class AerialArchiveExplorerApp:
         header = ttk.Frame(outer)
         header.grid(row=0, column=0, sticky="ew")
         header.columnconfigure(1, weight=1)
-        ttk.Label(header, text=APP_NAME,
+        ttk.Label(header, text=f"{APP_NAME}  v{APP_VERSION}",
                   font=("TkDefaultFont", 18, "bold")).grid(row=0, column=0, sticky="w")
         ttk.Label(header, text=APP_SUBTITLE).grid(row=0, column=1, padx=18)
         ttk.Button(header, text="Sign Out", command=self.sign_out).grid(
