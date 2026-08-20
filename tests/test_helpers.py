@@ -11,6 +11,7 @@ from aerial_archive_explorer import (
     DownloadProduct,
     DiagnosticsBuffer,
     CredentialStore,
+    LocalTokenStore,
     SearchQuery,
     best_product,
     build_metadata_block,
@@ -317,3 +318,34 @@ def test_credential_store_round_trip_update_and_clear():
     store.clear()
     assert store.load() is None
     assert not backend.values
+
+
+def test_local_token_store_round_trip_update_clear_and_permissions(tmp_path):
+    import os
+    import stat
+
+    path = tmp_path / "nested" / "config.json"
+    store = LocalTokenStore(path)
+    assert store.load() is None
+    store.save("first-user", "first-token")
+    assert store.load() == ("first-user", "first-token")
+    if os.name == "posix":
+        # Owner-only permissions where the OS honors chmod bits.
+        mode = stat.S_IMODE(path.stat().st_mode)
+        assert not (mode & (stat.S_IRWXG | stat.S_IRWXO))
+    store.save("second-user", "second-token")
+    assert store.load() == ("second-user", "second-token")
+    assert "first-token" not in path.read_text()
+    store.clear()
+    assert store.load() is None
+    assert not path.exists()
+    # Clearing an already-absent file is a no-op, not an error.
+    store.clear()
+
+
+def test_local_token_store_ignores_corrupt_file(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text("not json", encoding="utf-8")
+    store = LocalTokenStore(path)
+    with pytest.raises(ApiError):
+        store.load()

@@ -79,10 +79,19 @@ Treat endpoint request/response examples in this file as a design outline, not a
 - The user needs a free USGS EROS/ERS account, approved M2M access, and an application token.
 - Use the current token flow (`login-token`) with the username and application token. Do not implement the retired username/password `login` flow unless current official USGS documentation explicitly restores it.
 - Never log, print, persist in source code, include in exception messages, or put on the clipboard the application token or returned API key.
-- By default, keep credentials only in memory for the current run. A future “remember token” option must use an operating-system credential store; never use a plaintext config file.
 - Mask the token entry. Explain where to obtain M2M access/token in concise UI help.
 - Send the session API key only through the API's required authentication header, normally `X-Auth-Token`.
 - Attempt `logout` on normal shutdown when a session exists; failure to log out must not block application exit.
+
+### Saved-access storage: two explicit, mutually exclusive options
+
+The "remember token" feature has two storage backends, both live, both implemented in `CredentialStore`/`LocalTokenStore`:
+
+- **`CredentialStore` (OS keychain, default/recommended).** Uses `keyring`. The user is offered this by default in the access prompt with no extra action.
+- **`LocalTokenStore` (local file, explicit opt-in only).** A deliberate, documented exception to "never use a plaintext config file" — added because on an unsigned/ad-hoc-signed dev build, macOS Keychain ACLs bind to the exact code signature, so *every rebuild* looks like a new, unauthorized app and re-prompts for Keychain access. That's disruptive during active development on a personal machine. `LocalTokenStore` writes `{"username": ..., "token": ...}` as plain JSON to `local_config_path()` (`~/Library/Application Support/<APP_NAME>/config.json` on macOS, `%APPDATA%\<APP_NAME>\config.json` on Windows, `$XDG_CONFIG_HOME/<APP_NAME>/config.json` or `~/.config/...` on Linux), atomically (`.part` + replace), with best-effort `0700`/`0600` permissions via `os.chmod` (a no-op on Windows, where the per-user profile directory is already access-controlled by NTFS). It is genuinely lower security — not encrypted, readable by anything running as the same OS user, and exposed if that folder is ever zipped/backed up/shared. The risk is judged acceptable *only* because: this app is personal/single-user, not distributed with a token embedded, and an M2M token is a low-blast-radius, user-revocable credential (download authorization for public USGS imagery, no billing/PII/account-takeover surface).
+- The access prompt shows the local-file option as an explicitly labeled, unchecked-by-default checkbox with a visible lower-security caveat — never make it the default, never remove the caveat text, and never silently switch a user's existing Keychain-saved credential to the local file (or vice versa) without them re-choosing.
+- Only one store should hold a saved credential at a time: saving to one clears the other (best-effort), and `sign_out()` clears both. On launch, prefer `CredentialStore`; fall back to `LocalTokenStore` only when the keychain has nothing saved.
+- If a real fix for the Keychain re-prompting (e.g. a stable/consistent code signing identity across rebuilds) becomes available, prefer steering the user back toward `CredentialStore` rather than expanding what `LocalTokenStore` does.
 
 ## Deliverable and dependency policy
 
@@ -459,6 +468,7 @@ Cover at minimum:
 - viewer-cache identity, cache-hit reuse, no duplicate transfer, Save Image copying from cache, and separation of cached versus user-saved paths;
 - embedded-metadata text block generation (complete and missing-footprint frames) and TIFF embedding (pixel data preserved, tag written, cancellation leaves no partial file, non-image input leaves the source untouched);
 - filename sanitization/path traversal prevention, and that saved/downloaded filenames are always entity-ID-based regardless of the internal cache/URL name;
+- `LocalTokenStore` round-trip/update/clear, owner-only file permissions where the OS honors them, and safe handling of a corrupt/unreadable file;
 - redaction of tokens, API keys, and signed URLs;
 - atomic `.part` completion and cleanup behavior.
 
@@ -476,6 +486,7 @@ Inject the HTTP transport, clock/sleep function, and filesystem destination deci
 At minimum manually verify:
 
 - clean launch and clear setup guidance;
+- saved-access checkbox: unchecked by default (Keychain), saving with it checked writes only the local file and clears any existing Keychain entry (and vice versa), sign-out clears both, and relaunch loads from whichever store actually has a saved credential;
 - invalid-input focus/message behavior;
 - centered Paste Coordinates placement beneath the inputs, successful Google Maps and Google Earth KML coordinate paste, correct KML longitude/latitude reversal, unchanged fields after invalid clipboard data, and no automatic search;
 - responsive window during slow simulated requests;

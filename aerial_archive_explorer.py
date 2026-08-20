@@ -15,6 +15,7 @@ import random
 import re
 import shutil
 import ssl
+import sys
 import tempfile
 import threading
 import time
@@ -167,6 +168,88 @@ class CredentialStore:
             raise ApiError(
                 "Credential store",
                 "The saved credential could not be cleared.",
+                str(exc),
+            ) from exc
+
+
+def local_config_path() -> Path:
+    """Per-OS location for the optional local credential fallback file."""
+    if sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support" / APP_NAME
+    elif sys.platform == "win32":
+        base = Path(os.environ.get("APPDATA") or Path.home()) / APP_NAME
+    else:
+        base = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")) / APP_NAME
+    return base / "config.json"
+
+
+class LocalTokenStore:
+    """Explicitly opt-in fallback that stores the M2M username/token in a
+    plain local file instead of the OS credential store.
+
+    This is a deliberately lower-security choice, not a replacement for
+    ``CredentialStore``: the file is not encrypted, only restricted to the
+    owning user where the OS supports it (``0600``/``0700`` on POSIX; NTFS
+    already limits the per-user profile directory on Windows). It exists
+    for a single-user, non-shared machine where repeated OS keychain
+    re-authorization prompts (e.g. after every unsigned development
+    rebuild) are more disruptive than the residual risk of a plaintext
+    file under the user's own profile. Never make this the default store;
+    only construct/use it when the user has explicitly opted in via the
+    access prompt, and prefer ``CredentialStore`` whenever both have a
+    saved credential.
+    """
+
+    def __init__(self, path: Path | None = None) -> None:
+        self.path = path or local_config_path()
+
+    def load(self) -> tuple[str, str] | None:
+        try:
+            if not self.path.exists():
+                return None
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ApiError(
+                "Credential store",
+                "The local saved-access file could not be read.",
+                str(exc),
+            ) from exc
+        if not isinstance(data, Mapping):
+            return None
+        username, token = data.get("username"), data.get("token")
+        return (username, token) if username and token else None
+
+    def save(self, username: str, token: str) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(self.path.parent, 0o700)
+        except OSError:
+            pass
+        partial = self.path.with_name(self.path.name + ".part")
+        try:
+            partial.write_text(
+                json.dumps({"username": username, "token": token}), encoding="utf-8",
+            )
+            try:
+                os.chmod(partial, 0o600)
+            except OSError:
+                pass
+            partial.replace(self.path)
+        except OSError as exc:
+            partial.unlink(missing_ok=True)
+            raise ApiError(
+                "Credential store",
+                "The access could not be saved to the local file.",
+                str(exc),
+            ) from exc
+
+    def clear(self) -> None:
+        try:
+            self.path.unlink(missing_ok=True)
+        except OSError as exc:
+            raise ApiError(
+                "Credential store",
+                "The local saved-access file could not be removed.",
                 str(exc),
             ) from exc
 
@@ -1360,7 +1443,8 @@ class ImageViewer:
 
 class AerialArchiveExplorerApp:
     def __init__(self, root: tk.Tk, client: UsgsM2MClient | None = None,
-                 credential_store: CredentialStore | None = None) -> None:
+                 credential_store: CredentialStore | None = None,
+                 local_credential_store: LocalTokenStore | None = None) -> None:
         self.root = root
         self.diagnostics = DiagnosticsBuffer()
         LOG.setLevel(logging.INFO)
@@ -1370,6 +1454,7 @@ class AerialArchiveExplorerApp:
         self._log_refresh_id: str | None = None
         self.client = client or UsgsM2MClient()
         self.credential_store = credential_store or CredentialStore()
+        self.local_credential_store = local_credential_store or LocalTokenStore()
         self.username_value = ""
         self.token_value = ""
         self.access_window: tk.Toplevel | None = None
@@ -1386,7 +1471,7 @@ class AerialArchiveExplorerApp:
         self._build()
         LOG.info("%s started: version=%s Python=%s OS=%s frozen=%s",
                  APP_NAME, APP_VERSION, platform.python_version(), platform.platform(),
-                 bool(getattr(__import__("sys"), "frozen", False)))
+                 bool(getattr(sys, "frozen", False)))
         LOG.info("API base: %s", API_BASE)
         self.root.after(80, self._poll)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
@@ -1502,19 +1587,27 @@ class AerialArchiveExplorerApp:
         )
 
     def _initialize_access(self) -> None:
+        saved = None
+        source = ""
         try:
             saved = self.credential_store.load()
+            source = "the operating-system credential store"
         except ApiError as exc:
             LOG.error("Credential-store read failed: %s", exc.detail or exc.message)
-            saved = None
             messagebox.showwarning(
                 exc.category,
                 f"{exc.message}\n\nYou can continue without saved access.",
                 parent=self.root,
             )
+        if not saved:
+            try:
+                saved = self.local_credential_store.load()
+                source = "a local file on this machine"
+            except ApiError as exc:
+                LOG.error("Local credential file read failed: %s", exc.detail or exc.message)
         if saved:
             self.username_value, self.token_value = saved
-            LOG.info("Loaded saved M2M access from the operating-system credential store.")
+            LOG.info("Loaded saved M2M access from %s.", source)
             self.root.deiconify()
             self.root.lift()
         else:
@@ -1537,8 +1630,8 @@ class AerialArchiveExplorerApp:
         )
         ttk.Label(
             frame,
-            text=("Enter your USGS username and application token. They will be "
-                  "saved in the operating-system credential store, not in a file."),
+            text=("Enter your USGS username and application token. By default they "
+                  "are saved in the operating-system credential store, not in a file."),
             wraplength=440, justify=tk.LEFT,
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 14))
         username_var = tk.StringVar(value=self.username_value)
@@ -1549,12 +1642,24 @@ class AerialArchiveExplorerApp:
         ttk.Label(frame, text="Application token").grid(row=3, column=0, sticky="e", padx=(0, 8), pady=5)
         token_entry = ttk.Entry(frame, textvariable=token_var, show="•", width=38)
         token_entry.grid(row=3, column=1, sticky="ew", pady=5)
+        local_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            frame,
+            text="Save in a local file on this machine instead of the OS keychain (lower security)",
+            variable=local_var,
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Label(
+            frame,
+            text=("Only choose this on a personal, non-shared computer. The file is not "
+                  "encrypted; it relies on this OS account's normal file permissions."),
+            wraplength=440, justify=tk.LEFT, foreground="#555555",
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(2, 14))
         ttk.Button(
             frame, text="M2M Access / Token Help",
             command=lambda: webbrowser.open(M2M_ACCESS_URL),
-        ).grid(row=4, column=0, columnspan=2, pady=(9, 14))
+        ).grid(row=6, column=0, columnspan=2, pady=(0, 14))
         buttons = ttk.Frame(frame)
-        buttons.grid(row=5, column=0, columnspan=2, sticky="ew")
+        buttons.grid(row=7, column=0, columnspan=2, sticky="ew")
         ttk.Button(
             buttons, text="Skip for Now",
             command=self._skip_access,
@@ -1562,13 +1667,15 @@ class AerialArchiveExplorerApp:
         ttk.Button(
             buttons, text="Save & Continue",
             command=lambda: self._save_access(
-                username_var.get(), token_var.get(), username_entry, token_entry
+                username_var.get(), token_var.get(), local_var.get(),
+                username_entry, token_entry,
             ),
         ).pack(side=tk.RIGHT)
         window.bind(
             "<Return>",
             lambda _event: self._save_access(
-                username_var.get(), token_var.get(), username_entry, token_entry
+                username_var.get(), token_var.get(), local_var.get(),
+                username_entry, token_entry,
             ),
         )
         window.bind("<Escape>", lambda _event: self._skip_access())
@@ -1582,7 +1689,7 @@ class AerialArchiveExplorerApp:
         window.grab_set()
         username_entry.focus_set()
 
-    def _save_access(self, username: str, token: str,
+    def _save_access(self, username: str, token: str, use_local: bool,
                      username_entry: ttk.Entry, token_entry: ttk.Entry) -> None:
         username = username.strip()
         if not username:
@@ -1595,14 +1702,24 @@ class AerialArchiveExplorerApp:
                                  parent=self.access_window)
             token_entry.focus_set()
             return
+        store = self.local_credential_store if use_local else self.credential_store
+        destination = "a local file on this machine" if use_local else "the operating-system credential store"
         try:
-            self.credential_store.save(username, token)
+            store.save(username, token)
         except ApiError as exc:
             LOG.error("Credential-store save failed: %s", exc.detail or exc.message)
             messagebox.showerror(exc.category, exc.message, parent=self.access_window)
             return
+        # Only one store should hold the credential at a time so sign-out and
+        # a later reload behave predictably; clear the store not chosen this
+        # time, best-effort, without failing the save over it.
+        other = self.credential_store if use_local else self.local_credential_store
+        try:
+            other.clear()
+        except ApiError as exc:
+            LOG.warning("Could not clear the unused credential store: %s", exc.detail or exc.message)
         self.username_value, self.token_value = username, token
-        LOG.info("M2M access saved in the operating-system credential store.")
+        LOG.info("M2M access saved in %s.", destination)
         self._finish_access_prompt("Saved access loaded.")
 
     def _skip_access(self) -> None:
@@ -1626,6 +1743,7 @@ class AerialArchiveExplorerApp:
     def sign_out(self) -> None:
         try:
             self.credential_store.clear()
+            self.local_credential_store.clear()
         except ApiError as exc:
             LOG.error("Credential-store clear failed: %s", exc.detail or exc.message)
             messagebox.showerror(exc.category, exc.message, parent=self.root)
@@ -1741,7 +1859,6 @@ class AerialArchiveExplorerApp:
 
     def _set_window_icon(self) -> None:
         """Use the supplied platform icon when Tk supports its native format."""
-        import sys
         root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
         icon = root / "assets" / ("icon.ico" if sys.platform == "win32" else "icon.icns")
         try:
