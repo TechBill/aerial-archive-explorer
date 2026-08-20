@@ -1494,9 +1494,8 @@ class AerialArchiveExplorerApp:
         ttk.Label(header, text=f"{APP_NAME}  v{APP_VERSION}",
                   font=("TkDefaultFont", 18, "bold")).grid(row=0, column=0, sticky="w")
         ttk.Label(header, text=APP_SUBTITLE).grid(row=0, column=1, padx=18)
-        ttk.Button(header, text="Sign Out", command=self.sign_out).grid(
-            row=0, column=2, sticky="e"
-        )
+        self.access_button = ttk.Button(header, text="Connect M2M", command=self._toggle_access)
+        self.access_button.grid(row=0, column=2, sticky="e")
 
         form = ttk.LabelFrame(outer, text="Search location", padding=10)
         form.grid(row=1, column=0, sticky="ew", pady=(8, 8))
@@ -1649,6 +1648,21 @@ class AerialArchiveExplorerApp:
             self.root.lift()
         else:
             self.show_access_prompt(hide_main=True)
+        self._update_access_button()
+
+    def _connected(self) -> bool:
+        return bool(self.username_value and self.token_value)
+
+    def _update_access_button(self) -> None:
+        self.access_button.configure(
+            text="Disconnect M2M" if self._connected() else "Connect M2M"
+        )
+
+    def _toggle_access(self) -> None:
+        if self._connected():
+            self.sign_out()
+        else:
+            self.show_access_prompt()
 
     def show_access_prompt(self, hide_main: bool = False) -> None:
         if self.access_window and self.access_window.winfo_exists():
@@ -1776,6 +1790,7 @@ class AerialArchiveExplorerApp:
         self.root.deiconify()
         self.root.lift()
         self.status_var.set(status)
+        self._update_access_button()
 
     def sign_out(self) -> None:
         try:
@@ -1797,6 +1812,7 @@ class AerialArchiveExplorerApp:
         self.username_value = ""
         self.token_value = ""
         self._clear_session_display()
+        self._update_access_button()
         LOG.info("Signed out and cleared saved M2M access.")
         self.show_access_prompt(hide_main=True)
 

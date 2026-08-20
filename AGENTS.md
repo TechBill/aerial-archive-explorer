@@ -328,6 +328,7 @@ Use native-looking `ttk` widgets and keyboard-accessible controls. A practical l
 - Small search-radius field/control with unit label and conservative default.
 - Search button; Enter triggers search when focus is in a search input.
 - Concise link/help for USGS account and M2M token setup.
+- The header's access button reflects actual connection state rather than always reading "Sign Out": **Connect M2M** (opens the access prompt) when `username_value`/`token_value` are empty — e.g. after **Skip for Now** — and **Disconnect M2M** (calls `sign_out()`) once both are set. `_update_access_button()` is the single place that decides the label from `_connected()`; call it after every place credentials change (load, save, skip, sign out) rather than hardcoding the label anywhere else.
 
 ### Paste Coordinates behavior
 
