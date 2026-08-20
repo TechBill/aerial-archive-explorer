@@ -39,9 +39,10 @@ from PIL import Image, ImageTk, UnidentifiedImageError
 # Configuration and constants
 
 APP_NAME = "Aerial Archive Explorer"
+APP_VERSION = "2.0.1"
 APP_SUBTITLE = "Search and download historic USGS aerial photographs by location."
 API_BASE = "https://m2m.cr.usgs.gov/api/api/json/stable/"
-USER_AGENT = "AerialArchiveExplorer/0.1 (+independent USGS catalog client)"
+USER_AGENT = f"AerialArchiveExplorer/{APP_VERSION} (+independent USGS catalog client)"
 REQUEST_TIMEOUT = 45
 PAGE_SIZE = 100
 SEARCH_CAP = 500
@@ -192,6 +193,7 @@ class AerialFrame:
     coordinates: str = ""
     browse_url: str = ""
     download_hint: str = ""
+    footprint: tuple[tuple[float, float], ...] | None = None
     details: dict[str, str] = field(default_factory=dict)
 
     @property
@@ -225,6 +227,8 @@ class SearchResult:
     total_hits: int
     capped: bool
     dataset_alias: str
+    candidate_count: int = 0
+    invalid_footprints: int = 0
 
 
 # Pure helpers
@@ -352,6 +356,94 @@ def _lookup(values: Mapping[str, str], *names: str) -> str:
     return ""
 
 
+def polygon_area(footprint: tuple[tuple[float, float], ...]) -> float:
+    """Signed area of a footprint polygon via the shoelace formula."""
+    total = 0.0
+    count = len(footprint)
+    for index in range(count):
+        x1, y1 = footprint[index]
+        x2, y2 = footprint[(index + 1) % count]
+        total += x1 * y2 - x2 * y1
+    return total / 2.0
+
+
+def point_in_footprint(
+    latitude: float, longitude: float,
+    footprint: tuple[tuple[float, float], ...] | None,
+) -> bool:
+    """Return True when (latitude, longitude) is inside or on the boundary
+    of a valid four-corner footprint polygon."""
+    if not footprint or len(footprint) != 4 or abs(polygon_area(footprint)) < 1e-12:
+        return False
+    point_x, point_y = longitude, latitude
+    count = len(footprint)
+    for index in range(count):
+        x1, y1 = footprint[index]
+        x2, y2 = footprint[(index + 1) % count]
+        cross = (x2 - x1) * (point_y - y1) - (y2 - y1) * (point_x - x1)
+        if (abs(cross) < 1e-9
+                and min(x1, x2) - 1e-9 <= point_x <= max(x1, x2) + 1e-9
+                and min(y1, y2) - 1e-9 <= point_y <= max(y1, y2) + 1e-9):
+            return True
+    inside = False
+    for index in range(count):
+        x1, y1 = footprint[index]
+        x2, y2 = footprint[(index + 1) % count]
+        if (y1 > point_y) != (y2 > point_y):
+            intersect_x = x1 + (point_y - y1) * (x2 - x1) / (y2 - y1)
+            if point_x < intersect_x:
+                inside = not inside
+    return inside
+
+
+def _corner_label_matches(label: str, corner: str, axis: str) -> bool:
+    lowered = label.casefold()
+    compact = re.sub(r"[^a-z0-9]", "", lowered)
+    corner_names = {
+        "nw": ("northwest", "nw"), "ne": ("northeast", "ne"),
+        "se": ("southeast", "se"), "sw": ("southwest", "sw"),
+    }[corner]
+    has_corner = corner_names[0] in compact or bool(
+        re.search(rf"\b{corner_names[1]}\b", lowered)
+    )
+    if axis == "lat":
+        has_axis = "latitude" in compact or bool(re.search(r"\blat\b", lowered))
+    else:
+        has_axis = any(word in compact for word in ("longitude", "long", "lon"))
+    return has_corner and has_axis
+
+
+def extract_frame_footprint(
+    metadata: Mapping[str, str],
+) -> tuple[tuple[float, float], ...] | None:
+    """Extract the USGS frame's four corners (NW, NE, SE, SW) as a footprint
+    polygon of (longitude, latitude) tuples, or None when incomplete/invalid."""
+    corners: list[tuple[float, float]] = []
+    for corner in ("nw", "ne", "se", "sw"):
+        latitude: float | None = None
+        longitude: float | None = None
+        for label, raw_value in metadata.items():
+            try:
+                value = float(str(raw_value).strip())
+            except (TypeError, ValueError):
+                continue
+            if _corner_label_matches(label, corner, "lat"):
+                latitude = value
+            elif _corner_label_matches(label, corner, "lon"):
+                longitude = value
+        if latitude is None or longitude is None:
+            return None
+        if not (math.isfinite(latitude) and math.isfinite(longitude)):
+            return None
+        if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
+            return None
+        corners.append((longitude, latitude))
+    footprint = tuple(corners)
+    if len(set(footprint)) < 4 or abs(polygon_area(footprint)) < 1e-12:
+        return None
+    return footprint
+
+
 def normalize_scene(scene: Mapping[str, Any]) -> AerialFrame:
     meta = metadata_map(scene)
     entity_id = str(scene.get("entityId") or scene.get("entityID") or "").strip()
@@ -379,6 +471,7 @@ def normalize_scene(scene: Mapping[str, Any]) -> AerialFrame:
         coordinates=_lookup(meta, "Coordinates - Decimal Degrees", "Center Coordinate") or str(spatial or ""),
         browse_url=browse,
         download_hint=_lookup(meta, "High Resolution Download Available", "Download Available"),
+        footprint=extract_frame_footprint(meta),
         details=meta,
     )
 
@@ -631,8 +724,21 @@ class UsgsM2MClient:
             if len(unique) >= cap:
                 capped = True
                 break
-        frames = sorted(unique.values(), key=frame_sort_key)
-        return SearchResult(frames, total_hits, capped or total_hits > len(frames), alias)
+        candidates = list(unique.values())
+        covering = [
+            frame for frame in candidates
+            if point_in_footprint(query.latitude, query.longitude, frame.footprint)
+        ]
+        invalid_footprints = sum(1 for frame in candidates if not frame.footprint)
+        frames = sorted(covering, key=frame_sort_key)
+        LOG.info(
+            "Footprint coverage filter: candidates=%d retained=%d invalid_geometry=%d",
+            len(candidates), len(frames), invalid_footprints,
+        )
+        return SearchResult(
+            frames, total_hits, capped or total_hits > len(candidates), alias,
+            candidate_count=len(candidates), invalid_footprints=invalid_footprints,
+        )
 
     def download_options(self, dataset: str, entity_id: str) -> list[DownloadProduct]:
         data = self.request("download-options", {"datasetName": dataset, "entityIds": [entity_id]})
@@ -865,6 +971,100 @@ def prepare_viewable_image(path: Path, cancel: threading.Event) -> Path:
         ) from exc
 
 
+def build_metadata_block(frame: AerialFrame) -> str:
+    """Render a fixed-format USGS identity/footprint block for embedding in
+    a saved TIFF's ImageDescription tag (270).
+
+    Includes the raw four-corner footprint and center point flat as
+    decimal-degree longitude/latitude pairs -- not just the combined
+    "Coordinates / footprint" summary -- plus the archival identity
+    fields (entity ID, acquisition date, project/roll/frame, scale) a
+    researcher needs to trace the source. A downstream GDAL/rasterio
+    tool converting this into a GeoTIFF or KMZ needs the explicit CRS
+    and corner order stated (both included below) and should not assume
+    the raster's pixel orientation matches these corners without
+    checking -- USGS does not record the scan's physical orientation.
+    """
+    corners = frame.footprint  # (NW, NE, SE, SW), each (longitude, latitude)
+    corner_labels = ("NW_CORNER", "NE_CORNER", "SE_CORNER", "SW_CORNER")
+    if corners:
+        corner_lines = [
+            f"{label}: {longitude:.6f}, {latitude:.6f}"
+            for label, (longitude, latitude) in zip(corner_labels, corners, strict=True)
+        ]
+        center_lon = sum(longitude for longitude, _ in corners) / len(corners)
+        center_lat = sum(latitude for _, latitude in corners) / len(corners)
+        center_line = f"CENTER: {center_lon:.6f}, {center_lat:.6f}"
+    else:
+        corner_lines = [f"{label}: unknown" for label in corner_labels]
+        center_line = "CENTER: unknown"
+    acquisition = frame.acquisition_date.isoformat() if frame.acquisition_date else "unknown"
+    lines = [
+        "---USGS HISTORICAL METADATA---",
+        f"ENTITY_ID: {frame.entity_id or 'unknown'}",
+        f"DISPLAY_ID: {frame.display_id or 'unknown'}",
+        f"ACQUISITION_DATE: {acquisition}",
+        f"AGENCY: {frame.agency or 'unknown'}",
+        f"PROJECT: {frame.project or 'unknown'}",
+        f"ROLL: {frame.roll or 'unknown'}",
+        f"FRAME: {frame.frame or 'unknown'}",
+        f"SCALE: {frame.scale or 'unknown'}",
+        f"IMAGE_TYPE: {frame.image_type or 'unknown'}",
+        f"QUALITY: {frame.quality or 'unknown'}",
+        *corner_lines,
+        center_line,
+        "CORNER_ORDER: NW, NE, SE, SW (longitude, latitude)",
+        "SOURCE_CRS: EPSG:4326 (WGS 84)",
+        "NOTE: Footprint corners are USGS's nominal photographed-ground-area "
+        "coordinates, not a verified pixel-to-ground mapping. Confirm scan "
+        "orientation (rotation/flip) before using these corners as GCPs.",
+        f"SOURCE: {APP_NAME}",
+        "------------------------------",
+    ]
+    return "\n".join(lines)
+
+
+def embed_tiff_metadata(
+    source: Path, destination: Path, frame: AerialFrame, cancel: threading.Event,
+) -> Path:
+    """Write ``source`` to ``destination`` with the USGS metadata block
+    embedded in the TIFF ImageDescription tag. Raises ApiError (without
+    touching ``source``) if the image cannot be decoded/re-encoded; the
+    caller should fall back to a plain byte copy rather than fail the
+    whole save over a missing metadata tag."""
+    if cancel.is_set():
+        raise ApiError("Cancelled", "Save cancelled.")
+    partial = destination.with_name(destination.name + ".part")
+    try:
+        with Image.open(source) as image:
+            image.load()
+            if cancel.is_set():
+                raise ApiError("Cancelled", "Save cancelled.")
+            save_kwargs: dict[str, Any] = {}
+            compression = image.info.get("compression")
+            if compression and compression != "raw":
+                save_kwargs["compression"] = compression
+            image.save(
+                partial, format="TIFF",
+                tiffinfo={270: build_metadata_block(frame)},
+                **save_kwargs,
+            )
+        partial.replace(destination)
+        LOG.info("Embedded USGS metadata in saved TIFF: entity=%s path=%s",
+                 frame.entity_id, destination.name)
+        return destination
+    except ApiError:
+        partial.unlink(missing_ok=True)
+        raise
+    except (OSError, ValueError, UnidentifiedImageError) as exc:
+        partial.unlink(missing_ok=True)
+        raise ApiError(
+            "Filesystem",
+            "The USGS metadata could not be embedded in the saved TIFF.",
+            str(exc),
+        ) from exc
+
+
 class ViewerCache:
     def __init__(self) -> None:
         self._temporary = tempfile.TemporaryDirectory(prefix="aerial-archive-")
@@ -924,27 +1124,38 @@ class ImageViewer:
         self.window.title(f"{APP_NAME} — Viewer — {label}")
         self.window.geometry("1100x760")
         self.window.minsize(650, 450)
-        self.path, self.product, self.cache, self.cache_key = image_path, product, cache, cache_key
-        self.image = Image.open(image_path)
-        self.image.load()
+        self.frame, self.path, self.product = frame, image_path, product
+        self.cache, self.cache_key = cache, cache_key
+        self._source_image = Image.open(image_path)
+        self._source_image.load()
+        self.rotation = 0  # degrees counter-clockwise applied for display: 0/90/180/270
+        self.image = self._source_image
         self.photo: ImageTk.PhotoImage | None = None
         self.scale, self.min_scale, self.max_scale = 1.0, 0.01, 10.0
         self.offset_x = self.offset_y = 0.0
         self._pan: tuple[int, int] | None = None
         self._redraw_id: str | None = None
         self._quality_id: str | None = None
+        self._save_cancel: threading.Event | None = None
 
         bar = ttk.Frame(self.window, padding=(8, 6))
         bar.pack(fill=tk.X)
         prefix = "Browse quality — " if browse_quality else ""
         ttk.Label(bar, text=f"{prefix}{product.name} • {product.size_text}").pack(side=tk.LEFT, padx=(0, 12))
+        self.save_button: ttk.Button | None = None
         for text, command in (("Zoom +", lambda: self.zoom_center(1.2)),
                               ("Zoom −", lambda: self.zoom_center(1 / 1.2)),
-                              ("Fit to Window", self.fit), ("Save Image", self.save),
+                              ("Fit to Window", self.fit),
+                              ("Rotate Left 90°", lambda: self.rotate(90)),
+                              ("Rotate 180°", lambda: self.rotate(180)),
+                              ("Rotate Right 90°", lambda: self.rotate(-90)),
+                              ("Save Image", self.save),
                               ("Close", self.close)):
             button = ttk.Button(bar, text=text, command=command)
-            if text == "Save Image" and browse_quality:
-                button.configure(state=tk.DISABLED)
+            if text == "Save Image":
+                self.save_button = button
+                if browse_quality:
+                    button.configure(state=tk.DISABLED)
             button.pack(side=tk.LEFT, padx=3)
         self.zoom_var = tk.StringVar(value="100%")
         ttk.Label(bar, textvariable=self.zoom_var).pack(side=tk.RIGHT)
@@ -976,6 +1187,25 @@ class ImageViewer:
         self.offset_x = (width - iw * self.scale) / 2
         self.offset_y = (height - ih * self.scale) / 2
         self.redraw()
+
+    def rotate(self, delta: int) -> None:
+        """Rotate the displayed image by ``delta`` degrees (positive =
+        counter-clockwise "left", negative = clockwise "right").
+
+        View-only: re-derived from the untouched source image each time
+        (so repeated rotation never drifts or loses quality), and does
+        not affect what Save Image writes -- that always saves the
+        original downloaded bytes, matching every other saved output in
+        this app.
+        """
+        self.rotation = (self.rotation + delta) % 360
+        transpose = {
+            90: Image.Transpose.ROTATE_90,
+            180: Image.Transpose.ROTATE_180,
+            270: Image.Transpose.ROTATE_270,
+        }.get(self.rotation)
+        self.image = self._source_image if transpose is None else self._source_image.transpose(transpose)
+        self.fit()
 
     def zoom_center(self, factor: float) -> None:
         self.zoom_at(self.canvas.winfo_width() / 2, self.canvas.winfo_height() / 2, factor)
@@ -1059,9 +1289,11 @@ class ImageViewer:
         self.zoom_var.set(f"{self.scale * 100:.0f}%")
 
     def save(self) -> None:
-        filename = sanitize_filename(self.path.name)
-        selected = filedialog.asksaveasfilename(parent=self.window, initialfile=filename,
-                                                defaultextension=self.path.suffix)
+        filename = sanitize_filename(f"{self.frame.entity_id}.tif")
+        selected = filedialog.asksaveasfilename(
+            parent=self.window, initialfile=filename, defaultextension=".tif",
+            filetypes=(("TIFF image", "*.tif"), ("All files", "*.*")),
+        )
         if not selected:
             return
         destination = Path(selected)
@@ -1069,19 +1301,58 @@ class ImageViewer:
             return
         if destination.exists():
             destination.unlink()
+        if self.save_button:
+            self.save_button.configure(state=tk.DISABLED)
+        self._save_cancel = threading.Event()
+        threading.Thread(
+            target=self._save_worker, args=(destination, self._save_cancel), daemon=True,
+        ).start()
+
+    def _save_worker(self, destination: Path, cancel: threading.Event) -> None:
+        embedded = True
+        error: ApiError | None = None
         try:
-            self.cache.copy_to(self.cache_key, destination)
-            messagebox.showinfo(APP_NAME, f"Image saved to:\n{destination}", parent=self.window)
+            cached = self.cache.get(self.cache_key)
+            if not cached:
+                raise ApiError("Filesystem", "The cached image is no longer available.")
+            try:
+                embed_tiff_metadata(cached, destination, self.frame, cancel)
+                self.cache.record_saved(self.cache_key, destination)
+            except ApiError as exc:
+                if exc.category == "Cancelled":
+                    raise
+                embedded = False
+                LOG.warning(
+                    "Metadata embedding failed; saving original TIFF unchanged: %s",
+                    exc.message,
+                )
+                self.cache.copy_to(self.cache_key, destination)
         except ApiError as exc:
-            messagebox.showerror(APP_NAME, exc.message, parent=self.window)
+            error = exc
+        except (OSError, ValueError) as exc:
+            error = ApiError("Filesystem", "The image could not be saved.", str(exc))
+        if self.window.winfo_exists():
+            self.window.after(0, self._save_finished, destination, embedded, error)
+
+    def _save_finished(self, destination: Path, embedded: bool, error: ApiError | None) -> None:
+        if self.save_button and self.save_button.winfo_exists():
+            self.save_button.configure(state=tk.NORMAL)
+        if error:
+            if error.category != "Cancelled":
+                messagebox.showerror(error.category, error.message, parent=self.window)
+            return
+        suffix = "" if embedded else "\n\n(USGS metadata could not be embedded; original TIFF saved unchanged.)"
+        messagebox.showinfo(APP_NAME, f"Image saved to:\n{destination}{suffix}", parent=self.window)
 
     def close(self) -> None:
         if self._redraw_id:
             self.window.after_cancel(self._redraw_id)
         if self._quality_id:
             self.window.after_cancel(self._quality_id)
+        if self._save_cancel:
+            self._save_cancel.set()
         self.photo = None
-        self.image.close()
+        self._source_image.close()
         self.window.destroy()
 
 
@@ -1110,12 +1381,11 @@ class AerialArchiveExplorerApp:
         self.frames: list[AerialFrame] = []
         self.products: list[DownloadProduct] = []
         self.selected: AerialFrame | None = None
-        self.preview_photo: ImageTk.PhotoImage | None = None
         self._sort_column, self._sort_reverse = "date", False
         self._busy = False
         self._build()
-        LOG.info("%s started: version=0.1.0 Python=%s OS=%s frozen=%s",
-                 APP_NAME, platform.python_version(), platform.platform(),
+        LOG.info("%s started: version=%s Python=%s OS=%s frozen=%s",
+                 APP_NAME, APP_VERSION, platform.python_version(), platform.platform(),
                  bool(getattr(__import__("sys"), "frozen", False)))
         LOG.info("API base: %s", API_BASE)
         self.root.after(80, self._poll)
@@ -1123,7 +1393,7 @@ class AerialArchiveExplorerApp:
         self.root.after_idle(self._initialize_access)
 
     def _build(self) -> None:
-        self.root.title(APP_NAME)
+        self.root.title(f"{APP_NAME} v{APP_VERSION}")
         self._set_window_icon()
         self.root.geometry("1280x820")
         self.root.minsize(980, 650)
@@ -1135,7 +1405,7 @@ class AerialArchiveExplorerApp:
         header = ttk.Frame(outer)
         header.grid(row=0, column=0, sticky="ew")
         header.columnconfigure(1, weight=1)
-        ttk.Label(header, text=APP_NAME,
+        ttk.Label(header, text=f"{APP_NAME}  v{APP_VERSION}",
                   font=("TkDefaultFont", 18, "bold")).grid(row=0, column=0, sticky="w")
         ttk.Label(header, text=APP_SUBTITLE).grid(row=0, column=1, padx=18)
         ttk.Button(header, text="Sign Out", command=self.sign_out).grid(
@@ -1174,7 +1444,7 @@ class AerialArchiveExplorerApp:
         ttk.Label(form, text="Radius is a catalog tolerance, not a guarantee that the point appears in the scan.",
                   foreground="#555555").grid(row=2, column=0, columnspan=9, pady=(7, 0))
 
-        results = ttk.LabelFrame(outer, text="Matching aerial frames", padding=6)
+        results = ttk.LabelFrame(outer, text="Aerial frames covering this coordinate", padding=6)
         results.grid(row=2, column=0, sticky="nsew")
         results.rowconfigure(0, weight=1)
         results.columnconfigure(0, weight=1)
@@ -1190,30 +1460,33 @@ class AerialArchiveExplorerApp:
         yscroll.grid(row=0, column=1, sticky="ns")
         xscroll.grid(row=1, column=0, sticky="ew")
         self.tree.bind("<<TreeviewSelect>>", self.select_frame)
-        self.tree.bind("<Double-1>", lambda _event: self.load_preview())
         self.count_var = tk.StringVar(value="No search yet.")
         ttk.Label(results, textvariable=self.count_var).grid(row=2, column=0, sticky="w", pady=(4, 0))
 
         lower = ttk.Panedwindow(outer, orient=tk.HORIZONTAL)
         lower.grid(row=3, column=0, sticky="nsew", pady=(8, 0))
         details_frame = ttk.LabelFrame(lower, text="Selected frame details", padding=7)
-        preview_frame = ttk.LabelFrame(lower, text="Quick Preview — lower-resolution unrectified browse", padding=7)
+        actions_frame = ttk.LabelFrame(lower, text="View & download", padding=7)
         lower.add(details_frame, weight=3)
-        lower.add(preview_frame, weight=2)
+        lower.add(actions_frame, weight=2)
         self.details = tk.Text(details_frame, height=9, wrap=tk.WORD, state=tk.DISABLED)
         self.details.pack(fill=tk.BOTH, expand=True)
-        self.preview_label = ttk.Label(preview_frame, text="Select a frame to inspect it.", anchor=tk.CENTER)
-        self.preview_label.pack(fill=tk.BOTH, expand=True)
-        actions = ttk.Frame(preview_frame)
-        actions.pack(fill=tk.X, pady=(7, 0))
-        self.preview_button = ttk.Button(actions, text="Quick Preview", command=self.load_preview, state=tk.DISABLED)
-        self.viewer_button = ttk.Button(actions, text="Open Best Image in Viewer", command=self.open_best, state=tk.DISABLED)
-        self.save_button = ttk.Button(actions, text="Download / Save As", command=self.save_as, state=tk.DISABLED)
-        for button in (self.preview_button, self.viewer_button, self.save_button):
+        ttk.Label(
+            actions_frame,
+            text="Every listed frame's footprint covers the searched coordinate.",
+            foreground="#555555", wraplength=430, justify=tk.LEFT,
+        ).pack(fill=tk.X, anchor=tk.W)
+        self.product_var = tk.StringVar(value="Select a frame to check download products.")
+        ttk.Label(actions_frame, textvariable=self.product_var, wraplength=430, justify=tk.LEFT).pack(
+            fill=tk.X, anchor=tk.W, pady=(6, 10),
+        )
+        actions = ttk.Frame(actions_frame)
+        actions.pack(fill=tk.X)
+        self.viewer_button = ttk.Button(actions, text="View Aerial", command=self.open_best, state=tk.DISABLED)
+        self.save_button = ttk.Button(actions, text="Download", command=self.save_as, state=tk.DISABLED)
+        for button in (self.viewer_button, self.save_button):
             button.pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(actions, text="Open in EarthExplorer", command=lambda: webbrowser.open(EARTH_EXPLORER_URL)).pack(side=tk.RIGHT)
-        self.product_var = tk.StringVar(value="Select a frame to check download products.")
-        ttk.Label(preview_frame, textvariable=self.product_var, wraplength=430).pack(fill=tk.X, pady=(5, 0))
 
         status = ttk.Frame(outer)
         status.grid(row=4, column=0, sticky="ew", pady=(8, 0))
@@ -1380,10 +1653,7 @@ class AerialArchiveExplorerApp:
         self.tree.delete(*self.tree.get_children())
         self.count_var.set("No search yet.")
         self._details("")
-        self.preview_photo = None
-        self.preview_label.configure(image="", text="Select a frame to inspect it.")
-        self.preview_button.configure(state=tk.DISABLED)
-        self.viewer_button.configure(state=tk.DISABLED, text="Open Best Image in Viewer")
+        self.viewer_button.configure(state=tk.DISABLED, text="View Aerial")
         self.save_button.configure(state=tk.DISABLED)
         self.product_var.set("Select a frame to check download products.")
         self._set_ready("Signed out")
@@ -1581,9 +1851,6 @@ class AerialArchiveExplorerApp:
             self.frames, self.dataset_alias = value.frames, value.dataset_alias
             self._populate(value)
             self._set_ready("Complete" if value.frames else "No matches")
-        elif kind == "preview":
-            self._show_preview(value)
-            self._set_ready("Complete")
         elif kind == "products":
             entity_id, products = value
             if not self.selected or self.selected.entity_id != entity_id:
@@ -1594,7 +1861,7 @@ class AerialArchiveExplorerApp:
                                  "No immediately downloadable scan. Use EarthExplorer to review options.")
             browse_fallback = bool(self.selected.browse_url)
             self.viewer_button.configure(
-                text="Open Best Image in Viewer" if chosen else "View Browse Image Instead",
+                text="View Aerial" if chosen else "View Browse Image Instead",
                 state=tk.NORMAL if chosen or browse_fallback else tk.DISABLED,
             )
             self.save_button.configure(state=tk.NORMAL if chosen else tk.DISABLED)
@@ -1609,7 +1876,10 @@ class AerialArchiveExplorerApp:
                 except (OSError, UnidentifiedImageError) as exc:
                     messagebox.showerror(APP_NAME, f"The downloaded image could not be opened:\n{exc}", parent=self.root)
             else:
-                self._choose_and_copy(key, path.name)
+                self._choose_and_copy(key, frame)
+        elif kind == "saved_copy":
+            _destination, embedded = value
+            self._set_ready("Complete" if embedded else "Complete — saved without embedded metadata")
         elif kind == "browse_viewer":
             path, frame, product, key = value
             self.cache.record_cache(key, path)
@@ -1651,11 +1921,15 @@ class AerialArchiveExplorerApp:
             self.tree.insert("", tk.END, iid=str(index), values=values)
         shown = len(self.frames)
         suffix = "; list capped—narrow the radius" if result.capped else ""
-        self.count_var.set(f"{result.total_hits} matches; showing {shown}{suffix}")
+        if result.candidate_count > shown:
+            self.count_var.set(
+                f"{shown} frame(s) cover this exact coordinate "
+                f"({result.candidate_count} candidate scene(s) checked){suffix}"
+            )
+        else:
+            self.count_var.set(f"{shown} frame(s) cover this exact coordinate{suffix}")
         self.selected = None
         self.products = []
-        self.preview_photo = None
-        self.preview_label.configure(image="", text="Select a frame to inspect it.")
         self._details("")
 
     def sort(self, column: str) -> None:
@@ -1667,7 +1941,10 @@ class AerialArchiveExplorerApp:
                 return frame.acquisition_date or (dt.date.min if reverse else dt.date.max)
             return str(getattr(frame, column, "") or "").casefold()
         self.frames.sort(key=lambda frame: (key(frame), frame.display_id.casefold()), reverse=reverse)
-        self._populate(SearchResult(self.frames, len(self.frames), False, self.dataset_alias))
+        self._populate(SearchResult(
+            self.frames, len(self.frames), False, self.dataset_alias,
+            candidate_count=len(self.frames),
+        ))
         for iid, frame in enumerate(self.frames):
             if frame.entity_id == selected_entity:
                 self.tree.selection_set(str(iid))
@@ -1690,11 +1967,7 @@ class AerialArchiveExplorerApp:
             if label.casefold() not in known:
                 lines.append(f"{label}: {value}")
         self._details("\n".join(lines))
-        self.preview_photo = None
-        self.preview_label.configure(image="", text="Browse available." if frame.browse_url else "No browse image supplied by USGS.")
-        self.preview_button.configure(state=tk.NORMAL if frame.browse_url else tk.DISABLED)
-        self.viewer_button.configure(state=tk.DISABLED)
-        self.viewer_button.configure(text="Open Best Image in Viewer")
+        self.viewer_button.configure(state=tk.DISABLED, text="View Aerial")
         self.save_button.configure(state=tk.DISABLED)
         self.product_var.set("Checking available products…")
         generation = self.generation
@@ -1712,33 +1985,6 @@ class AerialArchiveExplorerApp:
             self.events.put(("products", (generation, (frame.entity_id, products))))
         except Exception as exc:
             self.events.put(("error", (generation, self._safe_error(exc))))
-
-    def load_preview(self) -> None:
-        if not self.selected or not self.selected.browse_url:
-            return
-        frame, generation = self.selected, self.generation
-        self._set_busy("Loading preview…")
-        threading.Thread(target=self._preview_worker, args=(frame, generation, self.cancel), daemon=True).start()
-
-    def _preview_worker(self, frame: AerialFrame, generation: int, cancel: threading.Event) -> None:
-        try:
-            data = fetch_bytes(frame.browse_url, cancel)
-            self.events.put(("preview", (generation, (frame.entity_id, data))))
-        except Exception as exc:
-            self.events.put(("error", (generation, self._safe_error(exc))))
-
-    def _show_preview(self, value: tuple[str, bytes]) -> None:
-        import io
-        entity, data = value
-        if not self.selected or self.selected.entity_id != entity:
-            return
-        try:
-            image = Image.open(io.BytesIO(data))
-            image.thumbnail((480, 230), Image.Resampling.LANCZOS)
-            self.preview_photo = ImageTk.PhotoImage(image)
-            self.preview_label.configure(image=self.preview_photo, text="")
-        except (OSError, UnidentifiedImageError) as exc:
-            raise ApiError("Preview", "The browse image format is unsupported or corrupt.", str(exc)) from exc
 
     def open_best(self) -> None:
         if best_product(self.products):
@@ -1840,7 +2086,7 @@ class AerialArchiveExplorerApp:
                 except (OSError, UnidentifiedImageError) as exc:
                     messagebox.showerror(APP_NAME, str(exc), parent=self.root)
             else:
-                self._choose_and_copy(key, cached.name)
+                self._choose_and_copy(key, frame)
             return
         if not messagebox.askokcancel(APP_NAME,
                 f"Download {product.name} ({product.size_text})?\n\nThe file will be cached for this app session.", parent=self.root):
@@ -1868,8 +2114,12 @@ class AerialArchiveExplorerApp:
         except Exception as exc:
             self.events.put(("error", (generation, self._safe_error(exc))))
 
-    def _choose_and_copy(self, key: tuple[str, str, str], filename: str) -> None:
-        selected = filedialog.asksaveasfilename(parent=self.root, initialfile=sanitize_filename(filename))
+    def _choose_and_copy(self, key: tuple[str, str, str], frame: AerialFrame) -> None:
+        filename = sanitize_filename(f"{frame.entity_id}.tif")
+        selected = filedialog.asksaveasfilename(
+            parent=self.root, initialfile=filename, defaultextension=".tif",
+            filetypes=(("TIFF image", "*.tif"), ("All files", "*.*")),
+        )
         if not selected:
             return
         destination = Path(selected)
@@ -1877,11 +2127,36 @@ class AerialArchiveExplorerApp:
             return
         if destination.exists():
             destination.unlink()
+        self.cancel = threading.Event()
+        self._set_busy("Saving…")
+        generation = self.generation
+        threading.Thread(
+            target=self._save_copy_worker, args=(key, frame, destination, generation, self.cancel),
+            daemon=True,
+        ).start()
+
+    def _save_copy_worker(self, key: tuple[str, str, str], frame: AerialFrame,
+                          destination: Path, generation: int, cancel: threading.Event) -> None:
         try:
-            self.cache.copy_to(key, destination)
-            self.status_var.set("Complete")
-        except ApiError as exc:
-            messagebox.showerror(exc.category, exc.message, parent=self.root)
+            cached = self.cache.get(key)
+            if not cached:
+                raise ApiError("Filesystem", "The cached image is no longer available.")
+            embedded = True
+            try:
+                embed_tiff_metadata(cached, destination, frame, cancel)
+                self.cache.record_saved(key, destination)
+            except ApiError as exc:
+                if exc.category == "Cancelled":
+                    raise
+                embedded = False
+                LOG.warning(
+                    "Metadata embedding failed; saving original TIFF unchanged: %s",
+                    exc.message,
+                )
+                self.cache.copy_to(key, destination)
+            self.events.put(("saved_copy", (generation, (destination, embedded))))
+        except Exception as exc:
+            self.events.put(("error", (generation, self._safe_error(exc))))
 
     def close(self) -> None:
         LOG.info("Application shutdown requested.")

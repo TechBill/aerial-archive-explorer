@@ -20,13 +20,14 @@ The shipped application must be a **single Python source file** using Tkinter. I
 
 1. accept decimal-degree coordinates,
 2. search only the USGS Aerial Photo Single Frames collection,
-3. show matching frames in a useful, sortable list,
+3. show matching frames in a useful, sortable list, filtered to only those whose USGS four-corner footprint actually covers the searched coordinate (the radius search is just the candidate net; see "Exact-coverage footprint filtering" below),
 4. show acquisition year/date and key metadata,
-5. let the user inspect a quick browse preview,
-6. let the user download the best immediately available scan into temporary storage and open that full product in an interactive zoom/pan viewer, and
-7. let the user save the already-fetched viewer image permanently without downloading it again.
+5. let the user download the best immediately available scan into temporary storage and open that full product in an interactive zoom/pan viewer, and
+6. let the user save the already-fetched viewer image permanently without downloading it again.
 
-The app is an index and downloader, not a GIS. Historical scans are not necessarily georeferenced or georectified.
+The app is an index and downloader, not a GIS. Historical scans are not necessarily georeferenced or georectified. **Current implementation note:** an earlier iteration of this app briefly added an actual GCP-warp georeferencing feature (rasterio-based, producing a `_georef.tif`); it was deliberately reverted at the user's request and must not be reintroduced without being explicitly asked for again. What the app does do instead — and what stays in scope — is embedding the raw USGS footprint/identity data as plain text inside the saved TIFF (see "Embedded USGS metadata" below) so a *separate*, user-owned tool can do any warping/KMZ conversion. Embedding source data for another tool to consume is not the same thing as this app doing georeferencing math itself; keep that distinction intact in any future change here.
+
+There is no dedicated "quick preview" feature/button anymore (removed; see UI behavior below) — browse imagery is fetched only as an explicitly labeled fallback when no downloadable scan product is available.
 
 ## Scope boundaries
 
@@ -38,22 +39,24 @@ The app is an index and downloader, not a GIS. Historical scans are not necessar
 - USGS EROS Machine-to-Machine (M2M) API authentication with a USGS username and application token.
 - Dynamic discovery of the Aerial Photo Single Frames dataset alias.
 - Coordinate-based scene search, pagination, metadata normalization, and oldest-to-newest sorting.
+- Exact-coverage footprint filtering: after the radius/MBR candidate search, keep only frames whose USGS four-corner footprint actually contains the searched point (point-in-polygon, boundary inclusive); candidates with missing/invalid corner geometry are omitted from results, not shown as confirmed coverage. See "Exact-coverage footprint filtering" below.
 - Result filtering and sorting in the UI without repeating the network search.
-- Fast browse-image preview where USGS supplies one; browse imagery is for identification and is not the preferred viewer source.
-- A dedicated interactive aerial-image viewer with zoom and pan behavior modeled after `/Users/techbill/Documents/GitHub/lidar-hillshade-explorer/src/hillshade_viewer.py`.
+- Browse imagery fetch as an explicitly labeled fallback (**View Browse Image Instead**) only when no downloadable scan product is available for the selected frame; there is no separate always-on preview feature.
+- A dedicated interactive aerial-image viewer with zoom, pan, and view-only rotation behavior modeled after `/Users/techbill/Documents/GitHub/lidar-hillshade-explorer/src/hillshade_viewer.py`.
 - Temporary acquisition of the best immediately available scan for full-resolution viewing, with an option to save that same local file permanently.
 - Download-product discovery, destination selection, download progress, cancellation, and clear completion status.
+- Saved/downloaded TIFF outputs named by the frame's entity ID, with a plain-text USGS identity/footprint block embedded in the TIFF's ImageDescription tag. See "Embedded USGS metadata" below.
 - Links to the relevant EarthExplorer record or site when the API cannot provide an immediate download.
 - Cross-platform behavior on current supported Python releases where Tkinter is available.
 
 ### Explicitly out of scope for the initial app
 
-- Georeferencing, georectification, orthorectification, image warping, reprojection, mosaicking, or control-point selection.
+- Georeferencing, georectification, orthorectification, image warping, reprojection, mosaicking, or control-point selection. This was tried once (a rasterio-based GCP warp) and deliberately reverted; do not reintroduce it without an explicit new request. Embedding raw footprint/identity data as TIFF tags for a *separate* downstream tool to consume (in scope, see "Embedded USGS metadata") is a different thing from doing the warp math here — do not conflate the two.
 - Geofencing, polygon drawing, parcel lookup, address geocoding, or an interactive GIS map.
 - Automated image interpretation or computer vision.
 - Searching unrelated EarthExplorer datasets.
 - Bulk unattended harvesting, download queues that persist across launches, user accounts managed by this app, or cloud storage integration.
-- Pretending that a frame's catalog point or footprint guarantees that the entered point is visibly present in the scanned image.
+- Pretending that a frame's catalog point or footprint guarantees that the entered point is visibly present in the scanned image. (The exact-coverage filter confirms the *nominal* footprint contains the point per USGS's own corner metadata; it is not a pixel-level or orthorectified guarantee, and USGS does not record a scan's physical orientation, so a raw scan is not guaranteed to be north-up.)
 
 Do not quietly add an out-of-scope feature. Keep extension seams clean, document the idea, and defer it.
 
@@ -90,9 +93,10 @@ Treat endpoint request/response examples in this file as a design outline, not a
 - Prefer the standard library. Expected runtime libraries are:
   - Tkinter/ttk from the Python installation;
   - `urllib.request` or one deliberately chosen HTTP library;
-  - Pillow only if needed for reliable JPEG browse display and thumbnail scaling.
-- Do not introduce GIS libraries such as GDAL, Rasterio, GeoPandas, Shapely, or PyProj in this phase.
+  - Pillow, used for the viewer's rendering/rotation, browse-fallback decoding, and TIFF ImageDescription-tag metadata embedding on save.
+- Do not introduce GIS libraries such as GDAL, Rasterio, GeoPandas, Shapely, or PyProj in this phase. (Rasterio was added once for a GCP-warp georeferencing feature and removed at the user's request along with that feature; keep it out unless explicitly asked to bring warping back.)
 - Pin or bound third-party dependencies in the dependency file and explain how to install them.
+- `aerial_archive_explorer.spec` (PyInstaller) builds **onedir**, not onefile: `EXE(..., exclude_binaries=True)` → `COLLECT()` → `BUNDLE()` wraps the `COLLECT()` output on macOS. Onefile's bootloader self-extracts to a temp directory on every launch, which is what caused the Dock/taskbar icon to appear, vanish, and reappear after a delay; do not switch back to onefile (`binaries`/`datas` passed straight into `EXE()`) without expecting that regression.
 
 ## Architecture inside the single file
 
@@ -102,14 +106,16 @@ Keep these responsibilities separate even though they live in one module:
 
 - API base URL, request timeout, user agent, search limit/page size, default radius, retry limits, and UI column definitions.
 - No credentials, dataset alias, product ID, download URL, or machine-specific path in constants.
+- `APP_VERSION`: a plain `"MAJOR.MINOR.PATCH"` string, shown in the main window's title bar and header label (`f"{APP_NAME} v{APP_VERSION}"`) so a freshly built app is visually distinguishable, folded into `USER_AGENT` and the startup log line, and mirrored in `pyproject.toml`'s `version` and the macOS bundle's `CFBundleShortVersionString`/`CFBundleVersion` in `aerial_archive_explorer.spec`. Bump it whenever the user asks for a version bump or explicitly calls out a notable release; keep all of those spots in sync when you do.
 
 ### Data models
 
 Use small `@dataclass` value objects where useful:
 
 - `SearchQuery`: latitude, longitude, radius, optional date limits.
-- `AerialFrame`: normalized entity/display ID, acquisition date, year, agency, project, roll, frame, scale, image type, quality, coordinates/footprint summary, browse URL, and raw metadata needed for details.
+- `AerialFrame`: normalized entity/display ID, acquisition date, year, agency, project, roll, frame, scale, image type, quality, coordinates/footprint summary, a parsed four-corner `footprint` (NW/NE/SE/SW as `(longitude, latitude)` tuples, or `None` when the corner metadata is missing/invalid), browse URL, and raw metadata needed for details.
 - `DownloadProduct`: product ID, product name/resolution, file size when known, availability/order state, and entity ID.
+- `SearchResult`: frames (post-footprint-filter), total server-reported hits, capped flag, dataset alias, `candidate_count` (deduped candidates before filtering), and `invalid_footprints` (candidates dropped for missing/invalid corner geometry) — keep `candidate_count`/`invalid_footprints` distinct from `total_hits`/`frames` so the UI can report "N frames cover this coordinate (M candidates checked)" honestly rather than conflating raw search hits with confirmed coverage.
 - `ApiError`: a typed exception carrying a safe user-facing category and optional technical detail without secrets.
 
 Do not let Tkinter widgets depend directly on arbitrary raw USGS JSON. Normalize external data once at the API boundary. Preserve unknown or extra metadata in a raw/details mapping so useful fields are not discarded.
@@ -139,12 +145,9 @@ The client must not import or call Tkinter. Make it independently testable with 
 - Ignore stale worker results using a request/generation ID when a newer search supersedes an older one.
 - Coordinate cancellation and orderly shutdown.
 
-### Preview helper
+### Browse-fallback helper
 
-- Fetch browse bytes off the UI thread with a size limit and timeout.
-- Decode and resize while preserving aspect ratio.
-- Create/assign the Tk-compatible image on the UI thread and retain a strong reference so it is not garbage-collected.
-- Never stretch a browse image to imply exact geographic alignment.
+There is no standalone "quick preview" feature. `fetch_bytes()` (browse download with a size limit/timeout) exists solely to support the **View Browse Image Instead** fallback, used only when the selected frame has no immediately downloadable scan product — it opens the browse JPEG in the same interactive viewer, explicitly labeled **Browse quality**. Never stretch a browse image to imply exact geographic alignment.
 
 ### Interactive viewer
 
@@ -152,7 +155,8 @@ The client must not import or call Tkinter. Make it independently testable with 
 - Open it as a dedicated Tkinter `Toplevel` window owned by the main application. Do not start a second Tk root or event loop.
 - Use a dark canvas and Pillow-backed rendering, following the interaction pattern in `/Users/techbill/Documents/GitHub/lidar-hillshade-explorer/src/hillshade_viewer.py` without importing from or depending on that separate project.
 - The normal viewer source is a locally cached downloadable scan, not the low-resolution catalog browse image. Use a browse image in the viewer only through an explicitly labeled fallback when no downloadable scan is available.
-- Keep viewer state isolated from the main results table: source image, current scale, minimum/maximum scale, X/Y offset, active pan state, and pending redraw callback.
+- Keep viewer state isolated from the main results table: source image, current scale, minimum/maximum scale, X/Y offset, active pan state, current rotation, and pending redraw callback.
+- **Rotate Left 90° / Rotate 180° / Rotate Right 90°** buttons change only the displayed orientation (re-derived from the untouched source image via an exact, lossless transpose each time — never compounded/re-rotated from an already-rotated copy, so repeated clicks don't drift or lose quality). Rotation is view-only: it must not change what **Save Image** writes. Every saved/downloaded output stays the original scan's pixels (see Download helper) — this was a deliberate choice the user confirmed, not an oversight; do not make rotation destructive without being asked again.
 - Render only the visible source-image region when practical so large TIFF scans remain responsive and do not require constructing enormous scaled bitmaps.
 - Coalesce rapid wheel and drag events into throttled redraws with `after(...)` rather than rerendering excessively.
 - Closing the viewer must release image references without closing the main application or losing its search results. Session cache cleanup follows the cache-lifecycle rules below, not an unconditional delete on viewer close.
@@ -164,11 +168,13 @@ The client must not import or call Tkinter. Make it independently testable with 
 - On success, flush/close and atomically rename to the final filename.
 - On failure or cancellation, close handles and offer to remove the partial file. Never overwrite an existing file without explicit user confirmation.
 - Sanitize server-provided filenames and prevent path traversal.
+- The filename the user is offered when saving/downloading — from both the main window's **Download** button and the viewer's **Save Image** — is always `sanitize_filename(f"{frame.entity_id}.tif")`, independent of the internal session-cache filename or the download URL's opaque path component. Do not let an internal cache name leak into the save dialog again.
+- **Embedded USGS metadata:** every saved/downloaded TIFF gets a plain-text identity/footprint block written into its ImageDescription tag (270) via `embed_tiff_metadata()`/`build_metadata_block()` — entity ID, acquisition date, agency/project/roll/frame/scale, all four corners and center as flat decimal-degree `longitude, latitude` pairs, an explicit corner-order line, `SOURCE_CRS: EPSG:4326`, and a note that the corners are USGS's nominal footprint, not a verified pixel mapping. This exists so a separate downstream tool (e.g. a TIFF→KMZ converter) doesn't have to re-query USGS metadata; keep the field list and format stable since another tool may already parse it. Because this requires a full Pillow decode/re-encode, it must run on a background thread (never the Tk thread) and must fall back to a plain byte-for-byte copy — with the user told, not silently — if the embed step fails for any reason; a save must never fail outright just because the metadata tag couldn't be written.
 
 ### Viewer image cache
 
 - Use a per-application-session temporary directory created with `tempfile.TemporaryDirectory` or an equivalently safe mechanism.
-- The **Open Best Image in Viewer** workflow streams the chosen USGS product to a `.part` file in this directory, then atomically renames it after a complete transfer.
+- The **View Aerial** workflow streams the chosen USGS product to a `.part` file in this directory, then atomically renames it after a complete transfer.
 - Key completed cache entries by dataset, entity ID, and product ID. Reopening the same product or subsequently choosing **Save Image** must reuse the completed local file instead of repeating the network download.
 - If the user already downloaded the identical product to a known existing path during this session, prefer opening that file rather than making a temporary copy.
 - Show required/available disk-space information when the API reports product size. Detect disk-full and permission failures cleanly.
@@ -260,20 +266,15 @@ Prefer these displayed fields when present:
 
 Missing metadata must render as an em dash or “Unknown,” never crash the search.
 
-### 5. Quick preview
+**Exact-coverage footprint filtering:** after deduplicating the MBR/radius candidate list above, parse each candidate's USGS NW/NE/SE/SW corner metadata into a `footprint` (tolerant of label spelling/order variants; see `extract_frame_footprint()`), then keep only candidates whose footprint contains the searched point via point-in-polygon (ray-casting, boundary/corner inclusive; see `point_in_footprint()`). A candidate with missing or invalid corner geometry (incomplete, out-of-range, or degenerate/zero-area) is *omitted* from the results shown to the user — never presented as confirmed coverage — and counted in a separate `invalid_footprints` diagnostic. Report both the pre-filter candidate count and the post-filter frame count (`SearchResult.candidate_count` / `.frames`) so the UI can say "N frames cover this coordinate (M candidates checked)" rather than calling the radius-search hit count a match count. This filter narrows results; it is not orthorectification or a pixel-level guarantee (USGS's corner coordinates are a nominal photogrammetric footprint, and the scan's physical pixel orientation is not verified against them).
 
-Use a browse URL explicitly supplied by the API response or current documented browse mechanism. Do not guess undocumented image URLs.
+### 5. Browse imagery (fallback only)
 
-- Preview is disabled when no browse is available.
-- Show a placeholder and a short message for missing, unauthorized, corrupt, or unsupported browse content.
-- A preview failure must not remove the result or prevent download.
-- Label the preview as an unrectified scan/browse image.
+Use a browse URL explicitly supplied by the API response or current documented browse mechanism. Do not guess undocumented image URLs. There is no standalone always-on preview UI; browse imagery is fetched only for the **View Browse Image Instead** fallback (see step 6) when the selected frame has no immediately downloadable scan product.
 
-The browse preview is intentionally separate from the full viewer workflow:
-
-- Label it **Quick Preview** and explain that it is lower resolution and intended to confirm the correct frame.
-- A missing browse image must not disable **Open Best Image in Viewer** when a downloadable product is available.
-- Double-clicking a result may open Quick Preview but must not silently begin a full-product download.
+- A missing/failed browse fetch must not remove the result or block the rest of the workflow — it only means the fallback isn't offered.
+- Show a clear error for unauthorized, corrupt, or unsupported browse content rather than crashing.
+- Label any browse image shown in the viewer as **Browse quality**, an unrectified scan/browse image.
 
 ### 6. Discover products, open the best image, and download
 
@@ -290,8 +291,8 @@ For the selected entity:
 
 Support two destinations through the same product-resolution and transfer pipeline:
 
-- **Open Best Image in Viewer:** rank products, explain the selected product and its size/state, download it to the session cache with visible progress and cancellation, then open the completed local file in the viewer.
-- **Download / Save As:** let the user select a product and permanent destination. If the identical completed product is already in the viewer cache, atomically copy it to the chosen destination instead of requesting/downloading it again.
+- **View Aerial:** rank products, explain the selected product and its size/state, download it to the session cache with visible progress and cancellation, then open the completed local file in the viewer. (Falls back to **View Browse Image Instead** when no downloadable product exists but a browse image does.)
+- **Download:** let the user select a product and permanent destination, offered as `<entity_id>.tif`. If the identical completed product is already in the viewer cache, atomically copy it to the chosen destination (with the USGS metadata block embedded — see Download helper) instead of requesting/downloading it again.
 
 “Best” means the highest-resolution product that USGS reports as immediately downloadable without a new paid scan/order. Prefer high-resolution (commonly 1,000 dpi) over medium-resolution (commonly 400 dpi) only when it is actually available for immediate download. Determine ranking from current product metadata and known normalized product labels; do not guess from file extensions or assume a fixed product ID. Show the chosen resolution and file size before a large transfer and allow cancellation.
 
@@ -337,28 +338,28 @@ Use native-looking `ttk` widgets and keyboard-accessible controls. A practical l
 ### Center: results
 
 - `ttk.Treeview` with vertical and horizontal scrolling.
-- Initial columns: Year, Date, Agency, Project, Roll, Frame, Scale, Type, Preview, Download, ID.
+- Initial columns: Year, Date, Agency, Project, Roll, Frame, Scale, Type, Preview (browse-available Yes/No, informational only — not tied to any preview action), Download, ID.
+- Every listed frame's footprint has been confirmed to contain the searched coordinate (see "Exact-coverage footprint filtering"); the results panel/label say so explicitly.
 - Oldest-to-newest ordering by default.
 - Clickable headings for sort; stable toggling between ascending and descending.
 - Single selection by default.
-- A clear count such as “142 matches; showing first 100.”
+- A clear count such as "N frame(s) cover this exact coordinate (M candidate scene(s) checked)"; append a capped-list note when applicable. Do not word this as generic "matches" — say explicitly that listed frames cover the coordinate, and that the candidate count is the pre-filter radius-search scope, not confirmed coverage.
 - Preserve selection when a local sort is applied, when possible.
 
-### Side or bottom: selected-frame details and preview
+### Side or bottom: selected-frame details and actions
 
 - Read-only details panel for normalized and extra metadata.
-- **Quick Preview** pane with aspect-preserving fit and loading state.
-- An **Open Best Image in Viewer** button driven by downloadable-product availability, not browse availability.
-- Product/resolution summary plus **Download / Save As** button.
-- Open in EarthExplorer button/link.
+- A "View & download" panel: a short note that every listed frame covers the searched coordinate, the best-available product name/size summary, and exactly three buttons: **View Aerial** (opens the best downloadable scan in the viewer; falls back to **View Browse Image Instead** driven by downloadable-product availability, not browse availability), **Download** (product/destination selection, offered as `<entity_id>.tif`), and **Open in EarthExplorer**.
+- There is no dedicated preview pane/button in the main window.
 
 ### Viewer window behavior
 
 - Title the window `Aerial Archive Explorer — Viewer` and include the selected frame's year and display/entity ID when available.
 - Identify the opened product in the viewer, including medium/high resolution or DPI and file size when known. If the source is only a browse fallback, display a prominent **Browse quality** label.
 - Initially fit and center the complete image within the canvas without upscaling beyond a sensible default unless needed for usability.
-- Provide visible **Zoom +**, **Zoom −**, **Fit to Window**, **Save Image**, and **Close** controls.
-- **Save Image** performs a safe Save As from the completed cached product. It must not trigger another API download. Disable it for a browse-only fallback unless saving browse imagery is deliberately supported and labeled.
+- Provide visible **Zoom +**, **Zoom −**, **Fit to Window**, **Rotate Left 90°**, **Rotate 180°**, **Rotate Right 90°**, **Save Image**, and **Close** controls.
+- Rotation is view-only (see "Interactive viewer" above) — it must never change what **Save Image** writes.
+- **Save Image** performs a safe Save As from the completed cached product (original pixels, unaffected by the current view rotation), offered as `<entity_id>.tif`, with the USGS metadata block embedded (see Download helper). It must not trigger another API download. Disable it for a browse-only fallback unless saving browse imagery is deliberately supported and labeled.
 - Mouse wheel/trackpad scrolling over the canvas zooms in or out. Support Windows/macOS `<MouseWheel>` event deltas and Linux `<Button-4>`/`<Button-5>` events.
 - Wheel zoom must stay anchored to the image point under the mouse cursor; that point should remain visually stationary as scale changes.
 - **Zoom +** and **Zoom −** zoom around the canvas center using consistent increments, approximately `1.2×` per step.
@@ -375,17 +376,17 @@ Use native-looking `ttk` widgets and keyboard-accessible controls. A practical l
 
 ### Status area
 
-- Human-readable state: Ready, Signing in, Searching, Loading preview, Preparing download, Downloading, Complete, Cancelled, or Error.
+- Human-readable state: Ready, Signing in, Searching, Loading browse (fallback only), Preparing download, Downloading, Saving, Complete, Cancelled, or Error.
 - Determinate progress when byte total is known; indeterminate otherwise.
-- Cancel button for active search/preview/download where cancellation is safe.
+- Cancel button for active search/browse-fetch/download/save where cancellation is safe.
 
 ### Interaction rules
 
 - Keep the window responsive during every network request and download.
 - Disable only actions that conflict with current work; do not freeze the entire form unnecessarily.
-- Double-clicking a result may show Quick Preview but must never start a full-product download without confirmation.
-- Search results remain visible if a preview or download fails.
-- A new search clears stale preview/product state only after input validation succeeds.
+- Double-clicking a result must never silently start a full-product download without confirmation (there is no Quick Preview to trigger instead — a double-click currently has no special behavior beyond normal row selection).
+- Search results remain visible if a browse fetch or download fails.
+- A new search clears stale product/details state only after input validation succeeds.
 - Do not show raw JSON or a traceback in ordinary dialogs. Provide a collapsible/copyable diagnostics area if implemented, with secrets and signed URLs redacted.
 - Use sensible minimum window dimensions, resizing weights, high-DPI-friendly spacing, and no color-only status cues.
 
@@ -412,9 +413,9 @@ Map errors into stable categories:
 - **No matches:** normal empty state, not an error. Suggest a slightly larger radius while noting coverage is incomplete.
 - **Network:** offline, DNS, TLS, timeout, throttling, or USGS outage. Preserve inputs/results and provide Retry.
 - **API/schema:** non-JSON response, error envelope, missing expected data, or ambiguous dataset. Show a concise message and safe diagnostics.
-- **Preview:** unavailable/unsupported/corrupt. Keep metadata and download controls usable.
+- **Browse fallback:** unavailable/unsupported/corrupt. Keep metadata and download controls usable; this only affects the **View Browse Image Instead** fallback, never the main results/download flow.
 - **Download preparation:** failed, delayed beyond timeout, or order required. Explain the state and provide EarthExplorer access when possible.
-- **Filesystem:** permission denied, disk full, invalid filename, existing destination, or interrupted transfer. Preserve or remove `.part` files according to the user's choice.
+- **Filesystem:** permission denied, disk full, invalid filename, existing destination, or interrupted transfer. Preserve or remove `.part` files according to the user's choice. A failure to embed the USGS metadata block specifically is not a save failure — fall back to a plain byte-for-byte copy and tell the user, rather than surfacing this as an error that blocks the save.
 
 Catch exceptions at worker boundaries, translate them once, and always restore the UI from its busy state in a `finally` path. Never use a bare `except`, silently ignore an error, or terminate the process for a recoverable problem.
 
@@ -450,10 +451,14 @@ Cover at minimum:
 - metadata normalization with complete, sparse, reordered, and unfamiliar fields;
 - date parsing and deterministic oldest-first ordering with unknown dates;
 - pagination, total cap, deduplication, and cancellation;
+- footprint extraction from USGS corner metadata (complete, incomplete, out-of-range, and degenerate/zero-area geometry) and its label-matching tolerance for spelling/order variants;
+- point-in-polygon coverage: interior, exterior, boundary/corner (inclusive), invalid footprint, and a real neighboring-frame footprint that never reaches the point;
+- search()-level filtering: a mix of a covering frame, a genuine non-covering neighbor, and a footprint-less candidate, asserting only the covering one survives and `candidate_count`/`invalid_footprints` are reported correctly;
 - download-option classification;
 - best-product ranking: immediately available high resolution over medium resolution, available medium resolution over browse fallback, and exclusion of paid/order-only products from automatic selection;
 - viewer-cache identity, cache-hit reuse, no duplicate transfer, Save Image copying from cache, and separation of cached versus user-saved paths;
-- filename sanitization/path traversal prevention;
+- embedded-metadata text block generation (complete and missing-footprint frames) and TIFF embedding (pixel data preserved, tag written, cancellation leaves no partial file, non-image input leaves the source untouched);
+- filename sanitization/path traversal prevention, and that saved/downloaded filenames are always entity-ID-based regardless of the internal cache/URL name;
 - redaction of tokens, API keys, and signed URLs;
 - atomic `.part` completion and cleanup behavior.
 
@@ -474,13 +479,13 @@ At minimum manually verify:
 - invalid-input focus/message behavior;
 - centered Paste Coordinates placement beneath the inputs, successful Google Maps and Google Earth KML coordinate paste, correct KML longitude/latitude reversal, unchanged fields after invalid clipboard data, and no automatic search;
 - responsive window during slow simulated requests;
-- no-results and many-results states;
+- no-results and many-results states, and that the results count/label read as exact-coverage ("N frames cover this coordinate"), not generic "matches";
 - sortable columns and stable selection;
-- missing and successful Quick Preview states, including a downloadable product with no browse image;
-- Open Best Image confirmation/product summary, transfer progress, cancellation, cache reuse on reopen, and Save Image without a second network request;
+- View Aerial confirmation/product summary, transfer progress, cancellation, cache reuse on reopen, and Save Image without a second network request; the browse fallback (**View Browse Image Instead**) when no downloadable product exists;
 - paid/order-only high resolution falling back to the best immediately downloadable scan and offering EarthExplorer without placing an order;
-- viewer initial fit, Zoom +/− controls, cursor-anchored wheel zoom on macOS/Windows/Linux event forms, zoom limits, left-drag pan offsets/cursor restoration, Fit to Window, resize behavior, keyboard shortcuts, and clean close/reopen;
-- product selection and download destination confirmation;
+- viewer initial fit, Zoom +/− controls, cursor-anchored wheel zoom on macOS/Windows/Linux event forms, zoom limits, left-drag pan offsets/cursor restoration, Fit to Window, the three rotate buttons (dimension swap on 90°/270°, view resets on Fit, does not alter Save Image output), resize behavior, keyboard shortcuts, and clean close/reopen;
+- product selection and download destination confirmation, with the offered filename always `<entity_id>.tif`;
+- that a saved/downloaded TIFF actually opens elsewhere with the embedded ImageDescription metadata readable, and that a save still completes (without embedded metadata, with a clear status note) if embedding is made to fail;
 - progress, cancellation, retry, existing-file handling, and app close during work;
 - display at common scaling settings on each supported OS.
 
@@ -489,6 +494,8 @@ Use a fake API client to exercise UI states deterministically. Keep the actual T
 ## Phased implementation
 
 Each phase should leave the app runnable and should add tests for its new pure or network-facing logic.
+
+**Historical note:** phases 1-4 describe how the app was originally built, including a since-removed Quick Preview button/panel (phase 3) later replaced by exact-coverage footprint filtering and a simplified three-button View Aerial / Download / Open in EarthExplorer layout. Treat "Scope boundaries," "Architecture inside the single file," and "UI behavior" above as the source of truth for current behavior; this section is left as delivery history, not a spec to re-implement literally.
 
 ### Phase 1: shell and search model
 
@@ -524,18 +531,21 @@ Each phase should leave the app runnable and should add tests for its new pure o
 
 ## Definition of done
 
-The initial release is done only when:
+Any change to this app is done only when it still holds true that:
 
 - the runnable production logic is contained in one Python file;
 - entered coordinates are validated and searched against the dynamically identified Aerial Photo Single Frames collection;
+- results are filtered to frames whose footprint actually covers the searched coordinate (not just the radius candidate net), and the UI says so honestly, distinguishing candidates-checked from frames-covering;
 - results include date/year and useful available metadata, sorted oldest first by default;
-- Quick Preview and product/download availability are represented honestly;
-- Open Best Image in Viewer uses the highest-resolution immediately downloadable scan, never silently initiates a paid/order-only request, and clearly labels any browse-quality fallback;
+- product/download availability is represented honestly;
+- View Aerial uses the highest-resolution immediately downloadable scan, never silently initiates a paid/order-only request, and clearly labels any browse-quality fallback;
 - a completed viewer download is reused by reopen and Save Image rather than downloaded again;
-- immediate and prepared downloads are handled without blocking Tkinter;
+- saved/downloaded TIFF filenames are entity-ID-based, and the USGS identity/footprint metadata block is embedded in the ImageDescription tag (or the user is told plainly that it wasn't, without the save failing outright);
+- viewer rotation stays view-only and never changes what gets saved;
+- immediate and prepared downloads, and metadata-embedding saves, are handled without blocking Tkinter;
 - credentials and signed URLs are protected;
 - cancellation, timeouts, partial files, API errors, and missing metadata are safe;
 - core pure logic and API workflows have deterministic tests; and
-- no georeferencing, geofencing, GIS, or unrelated imagery-search scope has slipped into version 1.
+- no georeferencing/warping math, geofencing, GIS, or unrelated imagery-search scope has slipped in (embedding raw footprint data for a separate downstream tool is fine; doing the warp here is not).
 
 When API behavior conflicts with this plan, preserve the user-facing goal and security rules, consult current official USGS documentation, add a redacted fixture/test for the observed response, and document the compatibility change.
