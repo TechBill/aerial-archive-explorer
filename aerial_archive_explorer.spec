@@ -20,12 +20,17 @@ analysis = Analysis(
 )
 pyz = PYZ(analysis.pure)
 
+# Build onedir (exclude_binaries + COLLECT) rather than onefile. A onefile
+# build's bootloader has to self-extract to a temp directory on every
+# launch before the real process starts, which is what causes the Dock/
+# taskbar icon to appear, vanish, and then reappear after a delay. Onedir
+# runs the real executable directly from the unpacked bundle, so the icon
+# stays put continuously from launch through window appearance.
 executable = EXE(
     pyz,
     analysis.scripts,
-    analysis.binaries,
-    analysis.datas,
     [],
+    exclude_binaries=True,
     name="Aerial Archive Explorer",
     debug=False,
     bootloader_ignore_signals=False,
@@ -35,9 +40,18 @@ executable = EXE(
     icon=str(project_root / "assets" / icon_name),
 )
 
+collection = COLLECT(
+    executable,
+    analysis.binaries,
+    analysis.datas,
+    strip=False,
+    upx=True,
+    name="Aerial Archive Explorer",
+)
+
 if sys.platform == "darwin":
     application = BUNDLE(
-        executable,
+        collection,
         name="Aerial Archive Explorer.app",
         icon=str(project_root / "assets" / "icon.icns"),
         bundle_identifier="com.techbill.aerialarchiveexplorer",
